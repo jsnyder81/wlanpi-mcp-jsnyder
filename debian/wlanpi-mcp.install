@@ -1,3 +1,6 @@
 install/etc/wlanpi-mcp/ufw/wlanpi-mcp.rules /etc/wlanpi-mcp/ufw
 install/etc/wlanpi-mcp/ufw/current-rules-version /etc/wlanpi-mcp/ufw
 install/etc/wlanpi-mcp/ufw/wlanpi-mcp-ufw-rules-setup.sh /etc/wlanpi-mcp/ufw
+install/etc/wlanpi-mcp/nginx/wlanpi_mcp_tls.conf /etc/wlanpi-mcp/nginx
+install/etc/wlanpi-mcp/nginx/wlanpi-mcp-nginx-setup.sh /etc/wlanpi-mcp/nginx
+debian/wlanpi-mcp-ufw-first-boot.service /lib/systemd/system

@@ -4,14 +4,26 @@ set -e
 case "$1" in
     purge)
         rm -rf /etc/wlanpi-mcp
+        rm -rf /var/log/wlanpi-mcp
     ;;
 
     remove)
-        # Close the SSE port and remove the UFW application profile that the
+        # Take the HTTPS front-end out of nginx. The symlink in sites-enabled
+        # is ours (not dpkg-owned), so remove it here and reload nginx, which
+        # keeps running for wlanpi-core. Skip the reload in a chroot.
+        rm -f /etc/nginx/sites-enabled/wlanpi_mcp_tls.conf
+        if command -v nginx >/dev/null 2>&1 && ! ischroot; then
+            if nginx -t >/dev/null 2>&1; then
+                deb-systemd-invoke reload nginx.service >/dev/null 2>&1 || true
+            fi
+        fi
+
+        # Close the ports and remove the UFW application profile that the
         # setup script installed into /etc/ufw/applications.d (not dpkg-owned,
-        # so we clean it up here). Delete the rule before removing the profile
-        # so ufw can still resolve the 'wlanpi-mcp' name.
+        # so we clean it up here). Delete the rules before removing the profile
+        # so ufw can still resolve the names.
         if command -v ufw >/dev/null 2>&1; then
+            ufw delete allow wlanpi-mcp-tls || true
             ufw delete allow wlanpi-mcp || true
         fi
         rm -f /etc/ufw/applications.d/wlanpi-mcp

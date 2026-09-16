@@ -1,3 +1,33 @@
+wlanpi-mcp (0.7.0-1) unstable; urgency=medium
+
+  * tls: the SSE transport is now served over HTTPS on port 8767. The package
+    installs an nginx site (/etc/wlanpi-mcp/nginx/wlanpi_mcp_tls.conf) that
+    terminates TLS with the self-signed device certificate wlanpi-core
+    generates (/etc/nginx/ssl/self-signed-wlanpi.*) and proxies to the MCP
+    daemon on loopback. postinst links it into /etc/nginx/sites-enabled via
+    wlanpi-mcp-nginx-setup.sh, which validates the nginx config and unlinks
+    again on failure so nginx (shared with wlanpi-core) is never left broken;
+    postrm removes the link. Clients connect to https://<device>:8767/sse.
+  * The daemon now binds to 127.0.0.1 by default (WLANPI_MCP_HOST); the
+    cleartext port 8766 is no longer reachable from the LAN. On upgrade,
+    postinst moves a still-default WLANPI_MCP_HOST=0.0.0.0 in
+    /etc/wlanpi-mcp/config.env to 127.0.0.1 and leaves any other value alone.
+  * ufw: rules version 2. The application profile now defines wlanpi-mcp-tls
+    (8767/tcp), which is opened, and keeps wlanpi-mcp (8766/tcp) defined but
+    closed; the setup script deletes the version-1 'allow wlanpi-mcp' rule on
+    upgrade. Both setup scripts take environment overrides so they can be
+    exercised in tests.
+  * debian: depend on nginx and ufw explicitly; ship /var/log/wlanpi-mcp for
+    the front-end's access/error logs. Actually install
+    wlanpi-mcp-ufw-first-boot.service, which postinst enables inside a chroot
+    (image build) but which was never listed in wlanpi-mcp.install, so image
+    builds never applied the firewall rules on first boot.
+  * tests: new tests/test_tls_packaging.py covers the nginx site, the UFW
+    profile, both setup scripts (against temp dirs and stub ufw/ischroot),
+    the maintainer scripts and the loopback defaults.
+
+ -- Jake Snyder <jsnyder81@gmail.com>  Wed, 16 Sep 2026 00:00:00 +0000
+
 wlanpi-mcp (0.6.5-1) unstable; urgency=medium
 
   * capture: capture_scan/capture_observe now also save the raw pcapng to the

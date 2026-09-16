@@ -1,23 +1,32 @@
 #!/bin/bash
 #
-# Install the wlanpi-mcp UFW application profile and open its port.
+# Install the wlanpi-mcp UFW application profiles and open the HTTPS port.
 #
 # Mirrors the wlanpi-core UFW setup pattern: the app profile is staged under
 # /etc/wlanpi-mcp/ufw and copied into /etc/ufw/applications.d here, then
 # enabled with `ufw allow`. A version marker keeps this idempotent so it only
 # re-applies when the shipped rules version changes.
+#
+# Clients reach the MCP server through the nginx HTTPS front-end on 8767
+# (profile wlanpi-mcp-tls). The daemon itself binds to loopback, so its
+# cleartext port 8766 (profile wlanpi-mcp) is closed here, including on
+# upgrade from rules version 1 which had opened it.
+#
+# Paths are overridable through the environment for tests;
+# WLANPI_MCP_UFW_NO_ROOT_CHECK=1 skips the root check.
 
 set -o errexit
 set -o nounset
 set -o pipefail
 
-readonly RULES_DIR="/etc/wlanpi-mcp/ufw"
+readonly RULES_DIR="${WLANPI_MCP_UFW_RULES_DIR:-/etc/wlanpi-mcp/ufw}"
 readonly CURRENT_VERSION_FILE="${RULES_DIR}/current-rules-version"
-readonly INSTALLED_VERSION_FILE="/etc/wlanpi-mcp/installed-rules-version"
-readonly UFW_APPS_DIR="/etc/ufw/applications.d"
+readonly INSTALLED_VERSION_FILE="${WLANPI_MCP_UFW_INSTALLED_VERSION_FILE:-/etc/wlanpi-mcp/installed-rules-version}"
+readonly UFW_APPS_DIR="${WLANPI_MCP_UFW_APPS_DIR:-/etc/ufw/applications.d}"
 readonly RULES_FILE="${RULES_DIR}/wlanpi-mcp.rules"
 readonly UFW_APP_FILE="${UFW_APPS_DIR}/wlanpi-mcp"
-readonly LOGFILE="/var/log/wlanpi-mcp-firstboot.log"
+readonly LOGFILE="${WLANPI_MCP_UFW_LOGFILE:-/var/log/wlanpi-mcp-firstboot.log}"
+readonly NO_ROOT_CHECK="${WLANPI_MCP_UFW_NO_ROOT_CHECK:-0}"
 
 mkdir -p "$(dirname "$LOGFILE")" 2>/dev/null || true
 exec > >(tee -a "$LOGFILE") 2>&1
@@ -53,6 +62,7 @@ cleanup() {
 }
 
 check_root() {
+    [ "$NO_ROOT_CHECK" != "1" ] || return 0
     if [ "$(id -u)" -ne 0 ]; then
         error "This script must be run as root (current uid=$(id -u))"
     fi
@@ -118,13 +128,15 @@ apply_ufw_rules() {
         error "Failed to copy rules file to ${UFW_APP_FILE}"
     fi
 
-    # Drop the legacy literal-port rule from pre-0.3.3 packages so it doesn't
-    # linger as a duplicate of the new profile-based rule.
+    # Close the cleartext daemon port: the literal-port rule from pre-0.3.3
+    # packages and the wlanpi-mcp profile rule from rules version 1. The
+    # daemon now binds to loopback behind the nginx HTTPS front-end.
     ufw delete allow 8766/tcp >/dev/null 2>&1 || true
+    ufw delete allow wlanpi-mcp >/dev/null 2>&1 || true
 
     log_info "Applying UFW rules..."
-    if ! ufw allow wlanpi-mcp >/dev/null 2>&1; then
-        error "Failed to allow wlanpi-mcp in UFW"
+    if ! ufw allow wlanpi-mcp-tls >/dev/null 2>&1; then
+        error "Failed to allow wlanpi-mcp-tls in UFW"
     fi
     if ! ufw reload >/dev/null 2>&1; then
         error "Failed to reload UFW"

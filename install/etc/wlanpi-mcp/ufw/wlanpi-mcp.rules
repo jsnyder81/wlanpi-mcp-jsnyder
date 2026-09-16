@@ -1,4 +1,9 @@
+[wlanpi-mcp-tls]
+title=WLAN Pi MCP server over HTTPS
+description=nginx HTTPS front-end for the MCP server (SSE transport); this is the port clients connect to
+ports=8767/tcp
+
 [wlanpi-mcp]
-title=WLAN Pi MCP server
-description=MCP server exposing WLAN Pi capabilities to AI assistants (SSE transport)
+title=WLAN Pi MCP server (cleartext)
+description=The MCP daemon's own port. It binds to loopback and is fronted by nginx on 8767, so this profile is not opened; it is kept so old 'allow wlanpi-mcp' rules can be deleted by name.
 ports=8766/tcp

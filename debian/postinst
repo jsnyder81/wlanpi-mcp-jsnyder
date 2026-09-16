@@ -3,6 +3,8 @@ set -e
 
 CONFIG_DIR=/etc/wlanpi-mcp
 CONFIG_FILE=$CONFIG_DIR/config.env
+NGINX_SETUP=/etc/wlanpi-mcp/nginx/wlanpi-mcp-nginx-setup.sh
+UFW_SETUP=/etc/wlanpi-mcp/ufw/wlanpi-mcp-ufw-rules-setup.sh
 
 case "$1" in
     configure)
@@ -11,43 +13,65 @@ case "$1" in
 
         # Write default config on first install. Auth is JWT passthrough:
         # SSE clients send a wlanpi-core token as 'Authorization: Bearer'.
+        # The daemon binds to loopback; nginx terminates TLS on 8767 and
+        # proxies to it (see /etc/wlanpi-mcp/nginx/wlanpi_mcp_tls.conf).
         if [ ! -f "$CONFIG_FILE" ]; then
-            cat > "$CONFIG_FILE" <<EOF
+            cat > "$CONFIG_FILE" <<EOCFG
 WLANPI_CORE_URL=http://localhost:31415
 # Fallback wlanpi-core JWT for stdio transport only. In SSE/daemon mode leave
 # empty: clients must send their own token as 'Authorization: Bearer <token>'.
 WLANPI_CORE_TOKEN=
-WLANPI_MCP_HOST=0.0.0.0
+# The daemon speaks cleartext HTTP and binds to loopback only. Clients connect
+# through the nginx HTTPS front-end the package installs on port 8767
+# (https://<device>:8767/sse), which proxies to this host:port.
+WLANPI_MCP_HOST=127.0.0.1
 WLANPI_MCP_PORT=8766
 LOG_LEVEL=INFO
 # Allow MCP clients to reboot/shut down the device. Set false to disable.
 ALLOW_POWER_CONTROL=true
-EOF
+EOCFG
             echo ""
             echo "============================================================"
-            echo "  WLAN Pi MCP Server installed (SSE on port 8766)"
+            echo "  WLAN Pi MCP Server installed"
+            echo "  Connect to https://<device>:8767/sse (self-signed cert)"
             echo "  Clients authenticate with a wlanpi-core JWT:"
             echo "  POST http://<device>:31415/api/v1/auth/token"
             echo "============================================================"
             echo ""
+        elif grep -qx 'WLANPI_MCP_HOST=0.0.0.0' "$CONFIG_FILE"; then
+            # Upgrade from a package that exposed the cleartext SSE port on all
+            # interfaces. nginx now terminates TLS on 8767 and proxies to
+            # loopback, so move a still-default bind to 127.0.0.1. Any other
+            # value is the admin's choice and is left alone.
+            sed -i 's/^WLANPI_MCP_HOST=0\.0\.0\.0$/WLANPI_MCP_HOST=127.0.0.1/' "$CONFIG_FILE"
+            echo "wlanpi-mcp: WLANPI_MCP_HOST changed to 127.0.0.1 in $CONFIG_FILE;"
+            echo "wlanpi-mcp: clients now connect to https://<device>:8767/sse"
         fi
 
         chmod 640 "$CONFIG_FILE"
         chown root:wlanpi "$CONFIG_FILE" 2>/dev/null || true
 
-        # Open the SSE port in UFW via the shipped application profile
-        # (/etc/ufw/applications.d/wlanpi-mcp). The setup script installs the
-        # profile and runs `ufw allow wlanpi-mcp`; 8766 is defined in
-        # /etc/wlanpi-mcp/ufw/wlanpi-mcp.rules, adjust there if the port changes.
-        # In a chroot (image build) ufw isn't active, so defer to the first-boot
-        # oneshot service instead of applying rules now.
+        # HTTPS front-end: link our nginx site into sites-enabled, validate
+        # and reload nginx. The script skips the nginx test/reload inside a
+        # chroot (image build), where the link is simply picked up at first
+        # boot. It refuses to link if wlanpi-core's device certificate is
+        # missing, and unlinks again if nginx rejects the configuration, so a
+        # failure here never breaks nginx (which also serves wlanpi-core).
+        if [ -x "$NGINX_SETUP" ]; then
+            "$NGINX_SETUP" apply || echo "Warning: wlanpi-mcp HTTPS front-end not enabled" >&2
+        fi
+
+        # Firewall: install the UFW application profiles from
+        # /etc/wlanpi-mcp/ufw/wlanpi-mcp.rules, open 8767 (wlanpi-mcp-tls)
+        # and close the daemon's cleartext 8766. In a chroot (image build)
+        # ufw isn't active, so defer to the first-boot oneshot service.
         if ischroot; then
             if [ -f /lib/systemd/system/wlanpi-mcp-ufw-first-boot.service ]; then
                 systemctl enable wlanpi-mcp-ufw-first-boot.service || true
             fi
         else
-            if [ -x /etc/wlanpi-mcp/ufw/wlanpi-mcp-ufw-rules-setup.sh ]; then
-                /etc/wlanpi-mcp/ufw/wlanpi-mcp-ufw-rules-setup.sh || true
+            if [ -x "$UFW_SETUP" ]; then
+                "$UFW_SETUP" || true
             fi
         fi
     ;;
