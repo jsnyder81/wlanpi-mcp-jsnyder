@@ -57,16 +57,11 @@ EOF
         # (/etc/ufw/applications.d/wlanpi-mcp). The setup script installs the
         # profile and runs `ufw allow wlanpi-mcp`; 8766/8767 are defined in
         # /etc/wlanpi-mcp/ufw/wlanpi-mcp.rules, adjust there if the ports change.
-        # In a chroot (image build) ufw isn't active, so defer to the first-boot
-        # oneshot service instead of applying rules now.
-        if ischroot; then
-            if [ -f /lib/systemd/system/wlanpi-mcp-ufw-first-boot.service ]; then
-                systemctl enable wlanpi-mcp-ufw-first-boot.service || true
-            fi
-        else
-            if [ -x /etc/wlanpi-mcp/ufw/wlanpi-mcp-ufw-rules-setup.sh ]; then
-                /etc/wlanpi-mcp/ufw/wlanpi-mcp-ufw-rules-setup.sh || true
-            fi
+        # In a chroot (image build) ufw isn't active; the first-boot oneshot
+        # (enabled by dh_installsystemd, see debian/rules) applies the rules on
+        # boot instead.
+        if ! ischroot && [ -x /etc/wlanpi-mcp/ufw/wlanpi-mcp-ufw-rules-setup.sh ]; then
+            /etc/wlanpi-mcp/ufw/wlanpi-mcp-ufw-rules-setup.sh || true
         fi
 
         # Reload nginx to pick up the MCP TLS site front. Skip when the

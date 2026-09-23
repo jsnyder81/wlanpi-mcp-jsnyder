@@ -1,3 +1,16 @@
+wlanpi-mcp (0.6.14-1) unstable; urgency=medium
+
+  * Ship wlanpi-mcp-ufw-first-boot.service. It was dropped from
+    debian/wlanpi-mcp.install in 0.3.4 and never reached the package, so
+    the postinst on image builds (chroot) found no unit to enable and
+    fresh images booted with 8766/8767 closed until a later wlanpi-mcp
+    upgrade ran the UFW setup script. The unit is now installed and
+    managed by dh_installsystemd (--no-start), matching wlanpi-core, so
+    it is enabled on image builds and apt installs and removed on purge.
+    The postinst's hand-rolled systemctl enable is gone. Fixes #33.
+
+ -- Josh Schmelzle <josh@joshschmelzle.com>  Tue, 22 Sep 2026 23:26:19 -0400
+
 wlanpi-mcp (0.6.13-1) unstable; urgency=medium
 
   * Add a regression test guarding get_token()'s transport-bound request token
