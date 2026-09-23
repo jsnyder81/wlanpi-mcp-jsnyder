@@ -55,7 +55,7 @@ def main() -> None:
 
     from wlanpi_mcp.server import create_server
 
-    mcp = create_server(client, host=host, port=port)
+    mcp = create_server(client, host=host, port=port, tools=settings.enabled_tools())
 
     if args.transport == "stdio":
         mcp.run(transport="stdio")

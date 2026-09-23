@@ -24,10 +24,8 @@ import asyncio
 import json
 import logging
 import re
-import ssl
 import time
 from collections.abc import Sequence
-from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlsplit, urlunsplit
 
@@ -39,6 +37,7 @@ from wlanpi_mcp.capture.dot11 import (
     parse_frame,
 )
 from wlanpi_mcp.capture.pcapng import PcapngReader
+from wlanpi_mcp.client.tls import core_ssl_context
 
 log = logging.getLogger(__name__)
 
@@ -88,15 +87,7 @@ async def connect_capture(settings: Any) -> "CaptureSocket":
     import websockets
 
     url = capture_ws_url(settings)
-    if url.startswith("wss://"):
-        ca = settings.WLANPI_CORE_CA
-        ssl_ctx = (
-            ssl.create_default_context(cafile=ca)
-            if ca and Path(ca).is_file()
-            else ssl.create_default_context()
-        )
-    else:
-        ssl_ctx = None
+    ssl_ctx = core_ssl_context(settings) if url.startswith("wss://") else None
     try:
         # ping_interval=None: this is a bounded streaming consumer with its own
         # deadline, and a continuous binary pcapng stream can delay pong replies

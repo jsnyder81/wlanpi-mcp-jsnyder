@@ -7,6 +7,7 @@ import pytest
 import respx
 
 from wlanpi_mcp.client.core_client import CoreClient
+from wlanpi_mcp.config import CLASSROOM_TOOLS
 from wlanpi_mcp.middleware.bearer_token import BearerTokenMiddleware
 from wlanpi_mcp.server import create_server
 
@@ -202,3 +203,25 @@ async def test_transport_populates_request_header_token(mcp):
         assert route.calls[0].request.headers["Authorization"] == "Bearer header.token"
     finally:
         current_token.reset(reset)
+
+
+def _tool_names(server) -> set[str]:
+    return {tool.name for tool in server._tool_manager.list_tools()}
+
+
+def test_every_classroom_tool_is_registered(core):
+    # Guards the allowlist against tool renames: a stale name would fail
+    # classroom startup, so catch it here instead.
+    assert CLASSROOM_TOOLS <= _tool_names(create_server(core))
+
+
+def test_classroom_profile_hides_control_tools(core):
+    names = _tool_names(create_server(core, tools=CLASSROOM_TOOLS))
+    assert names == CLASSROOM_TOOLS
+    for control in ("restart_service", "reboot_device", "set_regulatory_domain"):
+        assert control not in names
+
+
+def test_unknown_allowlisted_tool_fails_startup(core):
+    with pytest.raises(ValueError, match="no_such_tool"):
+        create_server(core, tools={"get_device_info", "no_such_tool"})

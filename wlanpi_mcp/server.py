@@ -1,5 +1,7 @@
 """Assemble the WLAN Pi MCP server and register all tools, resources, and prompts."""
 
+from collections.abc import Collection
+
 from wlanpi_mcp._compat import FastMCP, TransportSecuritySettings
 from wlanpi_mcp.client.core_client import CoreClient
 from wlanpi_mcp.prompts import diagnostics
@@ -25,10 +27,34 @@ from wlanpi_mcp.tools import (
 )
 
 
+def restrict_tools(mcp: FastMCP, allowed: Collection[str]) -> None:
+    """
+    Remove every registered tool not named in ``allowed``.
+
+    Raises ValueError if ``allowed`` names a tool that does not exist, so a
+    typo in a classroom allowlist fails at startup instead of silently
+    hiding a tool the instructor meant to expose.
+    """
+    registered = {tool.name for tool in mcp._tool_manager.list_tools()}
+    unknown = set(allowed) - registered
+    if unknown:
+        raise ValueError(f"tool allowlist names unknown tools: {sorted(unknown)}")
+    for name in registered - set(allowed):
+        mcp.remove_tool(name)
+
+
 def create_server(
-    client: CoreClient, host: str = "127.0.0.1", port: int = 8768
+    client: CoreClient,
+    host: str = "127.0.0.1",
+    port: int = 8768,
+    tools: Collection[str] | None = None,
 ) -> FastMCP:
-    """Create a WLAN Pi MCP server with all tools, resources, and prompts registered."""
+    """
+    Create a WLAN Pi MCP server with its tools, resources, and prompts registered.
+
+    ``tools`` limits the exposed tools to those names (see
+    ``Settings.enabled_tools``); None exposes every tool.
+    """
     mcp = FastMCP(
         "WLAN Pi",
         instructions=(
@@ -97,5 +123,8 @@ def create_server(
 
     # Prompts
     diagnostics.register(mcp)
+
+    if tools is not None:
+        restrict_tools(mcp, tools)
 
     return mcp

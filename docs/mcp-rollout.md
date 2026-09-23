@@ -19,6 +19,7 @@ Capture contract:
 | WebUI bearer migration (#120) | wlanpi-webui | The WebUI mints its own JWT and never reads the secret |
 | `getjwt --export` (#217) | wlanpi-core | Token export for client scripts |
 | Capture tools | wlanpi-mcp | Owner capture and subscribe, backed by the core capture WebSocket |
+| P5 (#4) | wlanpi-mcp | No `X-Wlanpi-Client` header; one CA-pinned TLS context for REST and the capture WebSocket; `WLANPI_CORE_TOKEN` env-only; `TOOL_PROFILE=classroom` / `TOOL_ALLOWLIST` |
 
 ## 2. On-box MCP
 

@@ -38,10 +38,9 @@ sequenceDiagram
         MW->>MW: stash JWT in contextvar<br/>publish sha256(JWT) principal on scope["user"]
         MW->>CC: dispatch tool → CoreClient.get(...)<br/>token read off this request (get_token)
     end
-    CC->>NG: GET /api/v1/... over localhost<br/>Authorization: Bearer <JWT><br/>X-Wlanpi-Client: mcp
-    NG->>NG: map X-Wlanpi-Client=="mcp"<br/>⇒ X-Real-IP = 192.0.2.1 (non-loopback)
-    NG->>API: proxy_pass unix:/run/wlanpi_core.sock<br/>X-Real-IP: 192.0.2.1 + Bearer JWT
-    API->>API: is_localhost_request? → NO (X-Real-IP not loopback)<br/>⇒ verify_jwt_token (DB lookup + revocation)
+    CC->>NG: GET /api/v1/... over localhost (TLS)<br/>Authorization: Bearer <JWT>
+    NG->>API: proxy_pass unix:/run/wlanpi_core.sock<br/>Bearer JWT
+    API->>API: Bearer presented ⇒ verify_jwt_token<br/>(DB lookup + revocation), whatever the source IP
     alt JWT valid
         API-->>NG: 200 + data
         NG-->>CC: 200 + data
@@ -59,13 +58,10 @@ flowchart LR
     A[Claude Desktop<br/>+ user JWT] -->|Bearer JWT| B[mcp-remote]
     B -->|Bearer JWT| C{MCP middleware<br/>token present?}
     C -->|no| C401[401 reject]
-    C -->|yes| D[CoreClient<br/>adds X-Wlanpi-Client: mcp]
-    D -->|localhost:31415<br/>Bearer + tag| E{nginx map<br/>tag == mcp?}
-    E -->|yes| F[X-Real-IP = 192.0.2.1]
-    E -->|no| G[X-Real-IP = 127.0.0.1]
-    F -->|non-loopback| H{core verify_auth_wrapper}
-    G -->|loopback| I[HMAC path<br/>needs shared secret]
-    H -->|JWT branch| J[verify_jwt_token<br/>validate + revocation]
+    C -->|yes| D[CoreClient]
+    D -->|https://localhost:31415<br/>Bearer JWT| H{core verify_auth_wrapper<br/>credential presented?}
+    H -->|Bearer| J[verify_jwt_token<br/>validate + revocation]
+    H -->|HMAC signature| I[HMAC path<br/>root-only secret; not MCP]
     J -->|valid| K[200 + data]
     J -->|invalid| L[401]
 ```
@@ -77,26 +73,22 @@ flowchart LR
 | Claude Desktop → mcp-remote | `Authorization: Bearer <JWT>` | none - just transport |
 | mcp-remote → MCP nginx front (`:8767` TLS) | the same Bearer on every `/mcp` POST | **nginx:** TLS termination with the self-signed cert; the JWT is encrypted in transit. (`:8766` is the plaintext fallback - same Bearer, but cleartext, for harnesses that cannot validate the cert) |
 | MCP nginx front → MCP middleware | same Bearer, forwarded to `127.0.0.1:8768` | **MCP:** reject if no Bearer (401); else stash JWT in contextvar |
-| MCP CoreClient → core nginx | `Bearer <JWT>` + **`X-Wlanpi-Client: mcp`** | none yet - MCP never validates |
-| core nginx → core (unix socket) | rewrites **`X-Real-IP` → `192.0.2.1`** because of the tag | **nginx:** selects which origin core sees |
-| core `verify_auth_wrapper` | sees non-loopback X-Real-IP + Bearer | **core:** takes JWT branch → validates token, checks revocation |
+| MCP CoreClient → core nginx (`:31415` TLS) | `Bearer <JWT>`, verified against the device cert (`WLANPI_CORE_CA`) | none yet - MCP never validates |
+| core nginx → core (unix socket) | same Bearer | none - transport only |
+| core `verify_auth_wrapper` | Bearer presented | **core:** dispatches on the credential → validates token, checks revocation |
 
 The single source of truth for "is this caller allowed" stays in core's `verify_jwt_token` -
 MCP and nginx only route; neither mints nor validates tokens. The one JWT the user holds
 is the same credential end to end.
 
-## Why the nginx X-Real-IP override is safe
+## No routing hint: core dispatches on the credential
 
-Core decides HMAC-vs-JWT purely from `X-Real-IP` (`is_localhost_request` reads it first),
-and core's own nginx sets that header. Today loopback callers get `X-Real-IP: 127.0.0.1`
-and are forced onto the HMAC path, which needs the root-owned shared secret that the
-unprivileged `wlanpi` user (which runs MCP) cannot read.
-
-The `X-Wlanpi-Client: mcp` tag makes nginx present a non-loopback sentinel
-(`192.0.2.1`, RFC 5737 TEST-NET-1) so core takes the JWT branch. This only lets a caller
-opt *into* the stricter, JWT-required scheme - the token is still validated (signature,
-expiry, revocation) by core. A caller that sends the tag without a valid JWT gets 401, so
-the tag can never bypass authentication, only demand more of the caller.
+Core used to pick HMAC or JWT from the source address, which forced loopback callers onto
+the HMAC path. MCP worked around that with an `X-Wlanpi-Client: mcp` header that core's
+nginx turned into a non-loopback `X-Real-IP`. Core now selects the scheme from the
+credential presented (wlanpi-core #159/#160): a Bearer token takes the JWT path from any
+source. The sentinel is gone from core's nginx, and CoreClient no longer sends the header
+(`tests/test_client.py` asserts its absence).
 
 ## One token per request: the stateless transport
 
@@ -138,5 +130,7 @@ cert) sends the token in cleartext - use it only on a trusted network.
 ## Stdio mode
 
 There are no HTTP headers in stdio transport, so the middleware/contextvar path does not
-apply. `WLANPI_CORE_TOKEN` from config/env is the fallback token source, and CoreClient
-still adds the `X-Wlanpi-Client: mcp` tag on outbound calls.
+apply. `WLANPI_CORE_TOKEN` is the fallback token source, read from the process
+environment only: a value in `/etc/wlanpi-mcp/config.env` is ignored with a warning, so a
+token is never persisted in a config file. Inject it at launch from a keychain or a 0600
+env file.

@@ -124,14 +124,18 @@ Settings load from the environment or `/etc/wlanpi-mcp/config.env`:
 | Variable | Default | Purpose |
 |---|---|---|
 | `WLANPI_CORE_URL` | `https://localhost:31415` | wlanpi-core API base URL |
-| `WLANPI_CORE_CA` | `/etc/nginx/ssl/self-signed-wlanpi.cert` | CA bundle for verifying wlanpi-core's TLS listener |
-| `WLANPI_CORE_TOKEN` | *(empty)* | Fallback JWT for **stdio mode only**; leave empty in daemon mode |
+| `WLANPI_CORE_CA` | `/etc/nginx/ssl/self-signed-wlanpi.cert` | Trust anchor for wlanpi-core's TLS listener (REST and capture WebSocket). Verification is never disabled; empty means the system trust store |
+| `WLANPI_CORE_TOKEN` | *(empty)* | Fallback JWT for **stdio mode only**; leave empty in daemon mode. Read from the **process environment only** - a value in `config.env` is ignored |
 | `WLANPI_MCP_HOST` | `127.0.0.1` | Daemon bind host (loopback-only; nginx fronts the public 8766/8767) |
 | `WLANPI_MCP_PORT` | `8768` | Daemon bind port (loopback-only upstream) |
 | `ALLOW_POWER_CONTROL` | `true` | Set `false` to disable the `reboot_device`/`shutdown_device` tools |
+| `TOOL_PROFILE` | `full` | `full` exposes every tool; `classroom` exposes only reads, scans and captures (no service control, power, network/radio reconfiguration, or stored credentials) |
+| `TOOL_ALLOWLIST` | *(empty)* | Comma-separated tool names; when set, exactly these tools are exposed and `TOOL_PROFILE` is ignored. An unknown name fails startup |
 | `LOG_LEVEL` | `INFO` | Logging level |
 
 Service management tools (`start_service`, `stop_service`, `restart_service`) are restricted to the allowlist in `wlanpi_mcp/config.py` (`ALLOWED_SERVICES`).
+
+The classroom tool set is `CLASSROOM_TOOLS` in the same file. For an instructor device, leave `TOOL_PROFILE=full`; for student devices, set `TOOL_PROFILE=classroom` in `/etc/wlanpi-mcp/config.env` and restart `wlanpi-mcp`.
 
 ## What's exposed
 
