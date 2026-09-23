@@ -180,7 +180,9 @@ async def test_auth_is_the_first_message_sent(ws):
 async def test_auth_failure_returns_an_error_dict(ws):
     ws.script = [AUTH_FAILED]
     tools, _ = _register()
-    result = await tools["capture_scan"].fn(channels=[6], duration_s=1)
+    result = await tools["capture_scan"].fn(
+        interface="wlanpi0", channels=[6], duration_s=1
+    )
 
     assert "AUTH_FAILED" in result["error"]
     assert "Token verification failed." in result["error"]
@@ -406,6 +408,75 @@ async def test_unknown_interface_in_supported_frequencies_is_an_error(ws):
     assert "configure" not in ws.commands
 
 
+async def test_unknown_interface_is_not_swapped_for_the_only_adapter(ws):
+    # A stale name must fail, not silently borrow the one real adapter's
+    # frequencies and then configure/start the name that does not exist.
+    ws.script = [
+        AUTH_OK,
+        sessions_event(),
+        event("SUPPORTED_FREQUENCIES", {"wlanpi1": [2412, 2437]}),
+    ]
+    tools, _ = _register()
+    result = await tools["capture_scan"].fn(interface="wlanpi0", duration_s=1)
+
+    assert "'wlanpi0'" in result["error"]
+    assert "wlanpi1" in result["error"]
+    assert "configure" not in ws.commands
+
+
+async def test_omitted_interface_picks_the_only_capture_adapter(ws):
+    ws.script = [
+        AUTH_OK,
+        # An adapter with no usable channels is not a candidate.
+        event("SUPPORTED_FREQUENCIES", {"wlanpi1": [], "wlanpi2": [2412, 2437]}),
+        sessions_event(),
+        CONFIG_APPLIED,
+        started_event(),
+        CAPTURE_ENDED,
+    ]
+    tools, _ = _register()
+    # Through FastMCP's dispatch, so the optional argument is really optional.
+    result = await tools["capture_scan"].run({"duration_s": 1})
+
+    assert result["interface"] == "wlanpi2"
+    # Supported frequencies are fetched once, and before the session check
+    # so that check runs against the picked interface.
+    assert ws.commands[:4] == [
+        "auth",
+        "get_supported_frequencies",
+        "list_sessions",
+        "configure",
+    ]
+    assert list(ws.payload("configure")["interfaces"]) == ["wlanpi2"]
+    assert ws.payload("start")["interfaces"] == ["wlanpi2"]
+
+
+async def test_omitted_interface_with_several_adapters_asks_for_a_choice(ws):
+    ws.script = [
+        AUTH_OK,
+        event("SUPPORTED_FREQUENCIES", {"wlanpi1": [5180, 5200], "wlanpi2": [2412]}),
+    ]
+    tools, _ = _register()
+    result = await tools["capture_scan"].fn(channels=[6], duration_s=1)
+
+    assert result["needsSelection"] is True
+    assert result["candidates"] == [
+        {"interface": "wlanpi1", "channel_count": 2},
+        {"interface": "wlanpi2", "channel_count": 1},
+    ]
+    assert ws.commands == ["auth", "get_supported_frequencies"]
+    assert ws.closed is True
+
+
+async def test_omitted_interface_with_no_adapters_is_an_error(ws):
+    ws.script = [AUTH_OK, event("SUPPORTED_FREQUENCIES", {"wlanpi0": []})]
+    tools, _ = _register()
+    result = await tools["capture_scan"].fn(duration_s=1)
+
+    assert "no capture interfaces" in result["error"]
+    assert "configure" not in ws.commands
+
+
 async def test_channel_set_failures_are_surfaced_with_the_single_radio_hint(ws):
     ws.script = [
         AUTH_OK,
@@ -420,7 +491,9 @@ async def test_channel_set_failures_are_surfaced_with_the_single_radio_hint(ws):
         CAPTURE_ENDED,
     ]
     tools, _ = _register()
-    result = await tools["capture_scan"].fn(channels=[6, 36], duration_s=1)
+    result = await tools["capture_scan"].fn(
+        interface="wlanpi0", channels=[6, 36], duration_s=1
+    )
 
     assert result["role"] == "owner"
     assert len(result["channel_issues"]) == 2
@@ -442,7 +515,9 @@ async def test_config_invalid_is_returned_as_an_error(ws):
         ),
     ]
     tools, _ = _register()
-    result = await tools["capture_scan"].fn(channels=[6], duration_s=1)
+    result = await tools["capture_scan"].fn(
+        interface="wlanpi0", channels=[6], duration_s=1
+    )
 
     assert "CONFIG_INVALID" in result["error"]
     assert "start" not in ws.commands
@@ -456,7 +531,9 @@ async def test_owner_stops_the_capture_even_when_consuming_raises(ws, monkeypatc
 
     monkeypatch.setattr(capture_tools, "_run_window", boom)
     tools, _ = _register()
-    result = await tools["capture_scan"].fn(channels=[6], duration_s=1)
+    result = await tools["capture_scan"].fn(
+        interface="wlanpi0", channels=[6], duration_s=1
+    )
 
     assert "dissector exploded" in result["error"]
     assert ws.commands[-1] == "stop"  # never leave an ownerless capture running
@@ -547,7 +624,9 @@ async def test_duration_is_clamped_to_the_maximum(ws):
         CAPTURE_ENDED,
     ]
     tools, _ = _register()
-    result = await tools["capture_scan"].fn(channels=[6], duration_s=9999)
+    result = await tools["capture_scan"].fn(
+        interface="wlanpi0", channels=[6], duration_s=9999
+    )
 
     assert result["duration_s"] == 60
 

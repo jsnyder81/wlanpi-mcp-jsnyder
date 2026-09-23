@@ -40,13 +40,13 @@ from wlanpi_mcp.capture.ws_client import (
 from wlanpi_mcp.client.core_client import CoreClient
 from wlanpi_mcp.config import get_settings
 from wlanpi_mcp.tools.capture import (
-    DEFAULT_INTERFACE,
     MAX_DWELL_MS,
     MIN_DWELL_MS,
     VALID_WIDTHS,
     _channels_to_freqs,
     _clamp,
     _freqs_by_adapter,
+    _resolve_adapter,
 )
 
 log = logging.getLogger(__name__)
@@ -208,7 +208,7 @@ def register(mcp: FastMCP, client: CoreClient) -> None:
 
     @mcp.tool()
     async def start_pcap_file(
-        interface: str = DEFAULT_INTERFACE,
+        interface: str | None = None,
         channels: list[int] | None = None,
         width: int = 20,
         dwell_ms: int = 250,
@@ -235,8 +235,11 @@ def register(mcp: FastMCP, client: CoreClient) -> None:
         with capture_observe instead.
 
         Args:
-            interface: Monitor-mode capture interface, always 'wlanpiN' (e.g.
-                'wlanpi0'), not 'wlan0'. See get_capture_channels.
+            interface: A capture interface as listed by get_capture_channels
+                (the device's monitor-mode interfaces, not the managed wlanN
+                ones). Omit it to use the device's only capture interface; if
+                there are several, the call returns 'needsSelection' with the
+                candidates instead of starting.
             channels: Channel numbers to hop (e.g. [1, 6, 11, 36]); 6 GHz can be
                 given as explicit frequencies in MHz. Omit to hop every channel
                 the adapter supports.
@@ -268,6 +271,14 @@ def register(mcp: FastMCP, client: CoreClient) -> None:
         try:
             await sock.authenticate(token)
 
+            by_adapter = None
+            if interface is None:
+                by_adapter = _freqs_by_adapter(await sock.get_supported_frequencies())
+                picked = _resolve_adapter(by_adapter, None)
+                if isinstance(picked, dict):
+                    return picked
+                interface = picked[0]
+
             existing = sessions_on_interface(await sock.list_sessions(), interface)
             if existing:
                 return {
@@ -284,18 +295,14 @@ def register(mcp: FastMCP, client: CoreClient) -> None:
                 except (TypeError, ValueError) as exc:
                     return {"error": str(exc)}
             else:
-                by_adapter = _freqs_by_adapter(await sock.get_supported_frequencies())
-                freqs = by_adapter.get(interface) or []
-                if not freqs and len(by_adapter) == 1:
-                    freqs = next(iter(by_adapter.values()))
-                if not freqs:
-                    known = sorted(k for k, v in by_adapter.items() if v)
-                    return {
-                        "error": (
-                            f"no supported frequencies reported for '{interface}'. "
-                            f"Capture interfaces on this device: {known or 'none'}"
-                        )
-                    }
+                if by_adapter is None:
+                    by_adapter = _freqs_by_adapter(
+                        await sock.get_supported_frequencies()
+                    )
+                picked = _resolve_adapter(by_adapter, interface)
+                if isinstance(picked, dict):
+                    return picked
+                freqs = picked[1]
 
             config = {
                 interface: {

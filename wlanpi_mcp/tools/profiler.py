@@ -40,7 +40,10 @@ def register(mcp: FastMCP, client: CoreClient) -> None:
         to determine their 802.11 capabilities (PHY support, spatial streams, etc.).
 
         Args:
-            interface: WLAN interface to use (e.g. 'wlan0')
+            interface: Optional WLAN interface to use. Omit it to let the
+                profiler use its own configured interface (the interface
+                setting in its config.ini, normally 'wlan0'). Pass one only
+                to pick a specific adapter; get_network_interfaces lists them.
             channel: 802.11 channel number to operate on
             frequency: Frequency in MHz (alternative to channel)
             ssid: SSID for the fake AP (default chosen by profiler)

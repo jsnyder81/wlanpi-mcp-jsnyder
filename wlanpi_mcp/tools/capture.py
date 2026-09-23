@@ -32,7 +32,6 @@ from wlanpi_mcp.config import get_settings
 
 log = logging.getLogger(__name__)
 
-DEFAULT_INTERFACE = "wlanpi0"
 DEFAULT_DURATION_S = 10
 MAX_DURATION_S = 60
 #: Extra margin, beyond the capture window, an owner keeps the socket open after
@@ -50,11 +49,11 @@ MAX_DWELL_MS = 60000
 FREQ_THRESHOLD_MHZ = 1000
 
 SINGLE_RADIO_HINT = (
-    "Channel changes failed during this capture. On devices where the capture "
-    "interface shares one radio with the managed wlan0, retuning fails with "
-    "'Device or resource busy' while wlan0 scans, so the listed channels were "
-    "not all visited — this result is partial. Take wlan0 down or use a second "
-    "adapter for reliable multi-channel capture."
+    "Channel changes failed during this capture. When the capture interface "
+    "shares its radio with a managed interface (such as wlan0), retuning fails "
+    "with 'Device or resource busy' while that interface scans, so the listed "
+    "channels were not all visited — this result is partial. Take the managed "
+    "interface down or use a second adapter for reliable multi-channel capture."
 )
 
 
@@ -114,6 +113,46 @@ def _freqs_by_adapter(data: Any) -> dict[str, list[int]]:
         for name, value in data.items()
         if isinstance(name, str)
     }
+
+
+def _resolve_adapter(
+    by_adapter: dict[str, list[int]], interface: str | None
+) -> tuple[str, list[int]] | dict[str, Any]:
+    """
+    Pick the capture interface and its frequencies from core's adapter list.
+
+    With no interface given, the device's only usable adapter is chosen; with
+    several, the caller gets a 'needsSelection' result to return instead. An
+    explicit interface must be one core reports, never swapped for another.
+    Returns (interface, freqs), or a result dict to hand back as-is.
+    """
+    usable = {name: freqs for name, freqs in by_adapter.items() if freqs}
+    if interface is None:
+        if len(usable) == 1:
+            return next(iter(usable.items()))
+        if not usable:
+            return {"error": "no capture interfaces reported by this device"}
+        return {
+            "needsSelection": True,
+            "candidates": [
+                {"interface": name, "channel_count": len(freqs)}
+                for name, freqs in sorted(usable.items())
+            ],
+            "message": (
+                "this device has several capture interfaces; call again with "
+                "one of the candidates as 'interface' (get_capture_channels "
+                "shows each one's channels)"
+            ),
+        }
+    freqs = usable.get(interface)
+    if not freqs:
+        return {
+            "error": (
+                f"no supported frequencies reported for '{interface}'. "
+                f"Capture interfaces on this device: {sorted(usable) or 'none'}"
+            )
+        }
+    return interface, freqs
 
 
 def _channels_to_freqs(channels: list[int]) -> list[int]:
@@ -221,7 +260,7 @@ def register(mcp: FastMCP, client: CoreClient) -> None:
 
     @mcp.tool()
     async def capture_scan(
-        interface: str = DEFAULT_INTERFACE,
+        interface: str | None = None,
         channels: list[int] | None = None,
         width: int = 20,
         dwell_ms: int = 250,
@@ -262,14 +301,17 @@ def register(mcp: FastMCP, client: CoreClient) -> None:
         reports the running config.
 
         Single-radio caveat: where the capture interface shares a radio with
-        the managed wlan0, channel changes fail while wlan0 scans. Any such
-        failures come back in 'channel_issues' — treat those results as
-        partial rather than complete.
+        a managed interface (such as wlan0), channel changes fail while that
+        interface scans. Any such failures come back in 'channel_issues' —
+        treat those results as partial rather than complete.
 
         Args:
-            interface: Monitor-mode capture interface, always named 'wlanpiN'
-                (e.g. 'wlanpi0'), not 'wlan0'. Use get_network_interfaces or
-                get_capture_channels to see what exists on this device.
+            interface: A capture interface as listed by get_capture_channels
+                (the device's monitor-mode interfaces, not the managed wlanN
+                ones). Omit it to use the device's only capture interface; if
+                there are several, the call returns 'needsSelection' with the
+                candidates instead of capturing. Do not infer the name from
+                wlan0/wlan1 numbering — take it from that list.
             channels: Channel numbers to hop (e.g. [1, 6, 11, 36]); 6 GHz can
                 be given as explicit frequencies in MHz. Omit to hop every
                 channel the adapter supports.
@@ -309,6 +351,14 @@ def register(mcp: FastMCP, client: CoreClient) -> None:
         try:
             await sock.authenticate(token)
 
+            by_adapter = None
+            if interface is None:
+                by_adapter = _freqs_by_adapter(await sock.get_supported_frequencies())
+                picked = _resolve_adapter(by_adapter, None)
+                if isinstance(picked, dict):
+                    return picked
+                interface = picked[0]
+
             # Own-vs-subscribe pre-flight: one owner per interface, so a
             # running session on this interface means start would fail with
             # INTERFACE_IN_USE.
@@ -321,21 +371,14 @@ def register(mcp: FastMCP, client: CoreClient) -> None:
                     except (TypeError, ValueError) as exc:
                         return {"error": str(exc)}
                 else:
-                    by_adapter = _freqs_by_adapter(
-                        await sock.get_supported_frequencies()
-                    )
-                    freqs = by_adapter.get(interface) or []
-                    if not freqs and len(by_adapter) == 1:
-                        freqs = next(iter(by_adapter.values()))
-                    if not freqs:
-                        known = sorted(k for k, v in by_adapter.items() if v)
-                        return {
-                            "error": (
-                                f"no supported frequencies reported for "
-                                f"'{interface}'. Capture interfaces on this "
-                                f"device: {known or 'none'}"
-                            )
-                        }
+                    if by_adapter is None:
+                        by_adapter = _freqs_by_adapter(
+                            await sock.get_supported_frequencies()
+                        )
+                    picked = _resolve_adapter(by_adapter, interface)
+                    if isinstance(picked, dict):
+                        return picked
+                    freqs = picked[1]
 
                 config = {
                     interface: {
@@ -437,13 +480,13 @@ def register(mcp: FastMCP, client: CoreClient) -> None:
         what is running.
 
         Single-radio caveat: the owner's channel hopping can fail on devices
-        where the capture interface shares a radio with the managed wlan0, so
+        where the capture interface shares a radio with a managed interface, so
         an observed capture may cover fewer channels than its config lists.
 
         Args:
             session_id: Session to attach to (from list_capture_sessions).
             interface: Instead of a session id, the monitor-mode capture
-                interface ('wlanpiN', e.g. 'wlanpi0') whose capture to watch.
+                interface whose capture to watch (see list_capture_sessions).
             duration_s: How long to listen, 1-60 seconds. The tool call blocks
                 for this whole window.
             max_frames: Cap on per-frame records in 'frames'; the
@@ -531,7 +574,7 @@ def register(mcp: FastMCP, client: CoreClient) -> None:
         List the packet captures currently running on this WLAN Pi.
 
         Each session reports its session_id, the owning principal, the
-        monitor-mode interfaces ('wlanpiN') it holds, its network namespace,
+        monitor-mode capture interfaces it holds, its network namespace,
         and the running config (channels, width, dwell, pcap filter). A
         session's interface cannot be captured on by anyone else — use
         capture_observe to watch it read-only.
@@ -563,7 +606,8 @@ def register(mcp: FastMCP, client: CoreClient) -> None:
         """
         List the channels each capture adapter on this WLAN Pi can tune to.
 
-        Capture adapters are the monitor-mode interfaces named 'wlanpiN'; the
+        This is the device's list of capture interfaces: only the names it
+        returns can be passed to capture_scan or start_pcap_file. The
         answer is namespace-aware and comes from the adapter's own radio, so
         it reflects the regulatory domain in force. Use it to pick the
         'interface' and 'channels' arguments for capture_scan.

@@ -15,6 +15,7 @@ from tests.test_capture_tools import (
     CAPTURE_ENDED,
     CONFIG_APPLIED,
     StubWS,
+    event,
     pcapng_chunks,
     session,
     sessions_event,
@@ -128,6 +129,57 @@ async def test_start_returns_immediately_then_writes_the_pcapng_file(capdir):
     assert len(data) == entry.bytes_written > 0
 
 
+async def test_start_without_an_interface_uses_the_only_capture_adapter(capdir):
+    _tmp, use = capdir
+    stub = use(
+        StubWS(
+            [
+                AUTH_OK,
+                event("SUPPORTED_FREQUENCIES", {"wlanpi3": [2412, 2437]}),
+                sessions_event(),
+                CONFIG_APPLIED,
+                started_event("cap_auto"),
+                CAPTURE_ENDED,
+            ]
+        )
+    )
+    tools = _register()
+    result = await tools["start_pcap_file"].run({"duration_s": 30})
+
+    assert result["interface"] == "wlanpi3"
+    await _await_capture("cap_auto")
+    assert stub.commands[:4] == [
+        "auth",
+        "get_supported_frequencies",
+        "list_sessions",
+        "configure",
+    ]
+    assert stub.payload("configure")["interfaces"]["wlanpi3"]["channels"] == [
+        {"freq": 2412, "width": 20},
+        {"freq": 2437, "width": 20},
+    ]
+
+
+async def test_start_without_an_interface_asks_when_there_are_several(capdir):
+    _tmp, use = capdir
+    stub = use(
+        StubWS(
+            [
+                AUTH_OK,
+                event("SUPPORTED_FREQUENCIES", {"wlanpi1": [5180], "wlanpi2": [2412]}),
+            ]
+        )
+    )
+    tools = _register()
+    result = await tools["start_pcap_file"].fn(channels=[6])
+
+    assert result["needsSelection"] is True
+    assert [c["interface"] for c in result["candidates"]] == ["wlanpi1", "wlanpi2"]
+    assert "configure" not in stub.commands
+    assert stub.closed is True
+    assert capture_file._CAPTURES == {}
+
+
 async def test_start_rejects_a_busy_interface(capdir):
     _tmp, use = capdir
     stub = use(StubWS([AUTH_OK, sessions_event(session("cap_x", ["wlanpi0"]))]))
@@ -154,7 +206,9 @@ async def test_start_clamps_duration_to_the_maximum(capdir):
         )
     )
     tools = _register()
-    result = await tools["start_pcap_file"].fn(channels=[6], duration_s=999999)
+    result = await tools["start_pcap_file"].fn(
+        interface="wlanpi0", channels=[6], duration_s=999999
+    )
 
     assert result["duration_s"] == 3600
     await _await_capture("cap_dur")
@@ -187,7 +241,9 @@ async def test_stop_ends_a_running_capture_early(capdir):
         )
     )
     tools = _register()
-    started = await tools["start_pcap_file"].fn(channels=[6], duration_s=30)
+    started = await tools["start_pcap_file"].fn(
+        interface="wlanpi0", channels=[6], duration_s=30
+    )
     assert started["status"] == "running"
     assert started["capture_id"] == "cap_run"
 
@@ -217,7 +273,9 @@ async def test_bytes_written_advances_while_the_capture_is_running(capdir):
         )
     )
     tools = _register()
-    started = await tools["start_pcap_file"].fn(channels=[6], duration_s=30)
+    started = await tools["start_pcap_file"].fn(
+        interface="wlanpi0", channels=[6], duration_s=30
+    )
     assert started["status"] == "running"
 
     entry = capture_file._CAPTURES["cap_prog"]
@@ -259,7 +317,7 @@ async def test_fetch_via_real_dispatch_path_resolves_capture_id(capdir):
         )
     )
     tools = _register()
-    await tools["start_pcap_file"].fn(channels=[6])
+    await tools["start_pcap_file"].fn(interface="wlanpi0", channels=[6])
     await _await_capture("cap_run_path")
 
     by_capture_id = await tools["fetch_pcap_file"].fn(capture_id="cap_run_path")
@@ -286,7 +344,7 @@ async def test_list_reports_started_captures(capdir):
         )
     )
     tools = _register()
-    await tools["start_pcap_file"].fn(channels=[6])
+    await tools["start_pcap_file"].fn(interface="wlanpi0", channels=[6])
     await _await_capture("cap_list")
 
     listing = await tools["list_pcap_files"].fn()
@@ -312,7 +370,7 @@ async def test_fetch_returns_a_pcapng_blob(capdir):
         )
     )
     tools = _register()
-    await tools["start_pcap_file"].fn(channels=[6])
+    await tools["start_pcap_file"].fn(interface="wlanpi0", channels=[6])
     entry = await _await_capture("cap_fetch")
 
     fetched = await tools["fetch_pcap_file"].fn(capture_id="cap_fetch")
@@ -364,7 +422,7 @@ async def test_fetch_by_session_id_falls_back_to_disk_after_registry_loss(capdir
         )
     )
     tools = _register()
-    await tools["start_pcap_file"].fn(channels=[6])
+    await tools["start_pcap_file"].fn(interface="wlanpi0", channels=[6])
     entry = await _await_capture("cap_disk")
     expected = Path(entry.path).read_bytes()
 
@@ -389,7 +447,7 @@ async def test_list_includes_on_disk_files_after_registry_loss(capdir):
         )
     )
     tools = _register()
-    await tools["start_pcap_file"].fn(channels=[6])
+    await tools["start_pcap_file"].fn(interface="wlanpi0", channels=[6])
     await _await_capture("cap_orphan")
 
     capture_file._CAPTURES.clear()
