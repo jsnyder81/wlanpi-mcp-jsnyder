@@ -11,14 +11,19 @@ def register(mcp: FastMCP, client: CoreClient) -> None:
     """Register the utility tools."""
 
     @mcp.tool(annotations=hints.READ_ONLY)
-    async def get_reachability() -> dict[str, Any]:
+    async def get_reachability(targets: list[str] | None = None) -> dict[str, Any]:
         """
         Test WLAN Pi network reachability.
 
         Pings the default gateway, checks DNS resolution, and verifies internet
         access. Use this to diagnose connectivity problems.
+
+        Args:
+            targets: Optional extra hostnames or IPs to ping as well
+                (e.g. ['8.8.8.8', 'intranet.example.com'])
         """
-        return await client.get("/api/v1/utils/reachability")
+        params = {"targets": targets} if targets else None
+        return await client.get("/api/v1/utils/reachability", params=params)
 
     @mcp.tool(annotations=hints.READ_ONLY)
     async def get_usb_interfaces() -> dict[str, Any]:

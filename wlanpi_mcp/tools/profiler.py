@@ -32,6 +32,10 @@ def register(mcp: FastMCP, client: CoreClient) -> None:
         wpa3_personal: bool | None = None,
         wpa3_personal_transition: bool | None = None,
         noAP: bool | None = None,
+        noprep: bool | None = None,
+        noprofilertlv: bool | None = None,
+        oui_update: bool | None = None,
+        no_bpf_filters: bool | None = None,
         debug: bool | None = None,
     ) -> dict[str, Any]:
         """
@@ -42,7 +46,7 @@ def register(mcp: FastMCP, client: CoreClient) -> None:
 
         Args:
             interface: WLAN interface to use (e.g. 'wlan0')
-            channel: 802.11 channel number to operate on
+            channel: 802.11 channel number to operate on (1-233)
             frequency: Frequency in MHz (alternative to channel)
             ssid: SSID for the fake AP (default chosen by profiler)
             no11r: Disable 802.11r (Fast BSS Transition) support
@@ -51,31 +55,33 @@ def register(mcp: FastMCP, client: CoreClient) -> None:
             wpa3_personal: Enable WPA3-Personal only mode
             wpa3_personal_transition: Enable WPA3-Personal Transition mode
             noAP: Run without bringing up an AP (passive capture only)
+            noprep: Skip interface preparation (use when the interface is
+                already set up in monitor mode on the right channel)
+            noprofilertlv: Don't add the profiler's vendor TLVs to beacons
+            oui_update: Update the OUI (manufacturer) database from the
+                Internet before starting; needs Internet access
+            no_bpf_filters: Remove the sniffer's BPF filters (sees more
+                frames, but may reduce profiler performance)
             debug: Enable debug logging in profiler
         """
-        body: dict[str, Any] = {}
-        if interface is not None:
-            body["interface"] = interface
-        if channel is not None:
-            body["channel"] = channel
-        if frequency is not None:
-            body["frequency"] = frequency
-        if ssid is not None:
-            body["ssid"] = ssid
-        if no11r is not None:
-            body["no11r"] = no11r
-        if no11ax is not None:
-            body["no11ax"] = no11ax
-        if no11be is not None:
-            body["no11be"] = no11be
-        if wpa3_personal is not None:
-            body["wpa3_personal"] = wpa3_personal
-        if wpa3_personal_transition is not None:
-            body["wpa3_personal_transition"] = wpa3_personal_transition
-        if noAP is not None:
-            body["noAP"] = noAP
-        if debug is not None:
-            body["debug"] = debug
+        args = {
+            "interface": interface,
+            "channel": channel,
+            "frequency": frequency,
+            "ssid": ssid,
+            "no11r": no11r,
+            "no11ax": no11ax,
+            "no11be": no11be,
+            "wpa3_personal": wpa3_personal,
+            "wpa3_personal_transition": wpa3_personal_transition,
+            "noAP": noAP,
+            "noprep": noprep,
+            "noprofilertlv": noprofilertlv,
+            "oui_update": oui_update,
+            "no_bpf_filters": no_bpf_filters,
+            "debug": debug,
+        }
+        body = {k: v for k, v in args.items() if v is not None}
 
         return await client.post("/api/v1/profiler/start", json=body)
 

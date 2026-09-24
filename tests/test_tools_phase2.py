@@ -75,7 +75,7 @@ async def test_create_vlan(client):
     )
     result = await client.post(
         "/api/v1/network/ethernet/eth0/vlan/10",
-        json=[{"family": 4, "local": "192.168.10.1", "prefixlen": 24}],
+        json=[{"family": "inet", "local": "192.168.10.1", "prefixlen": 24}],
     )
     assert "result" in result
 
@@ -124,6 +124,57 @@ async def test_start_profiler_builds_minimal_body():
     assert body["interface"] == "wlan0"
     assert body["channel"] == 6
     assert "frequency" not in body  # omitted None fields
+
+
+async def test_start_profiler_forwards_newer_flags():
+    from unittest.mock import AsyncMock, MagicMock
+
+    from wlanpi_mcp._compat import FastMCP
+    from wlanpi_mcp.tools.profiler import register
+
+    mock_client = MagicMock()
+    mock_client.post = AsyncMock(return_value={"success": True})
+
+    mcp = FastMCP("test")
+    register(mcp, mock_client)
+
+    await mcp._tool_manager._tools["start_profiler"].run(
+        {
+            "noprep": True,
+            "noprofilertlv": True,
+            "oui_update": False,
+            "no_bpf_filters": True,
+        }
+    )
+
+    assert mock_client.post.call_args.kwargs["json"] == {
+        "noprep": True,
+        "noprofilertlv": True,
+        "oui_update": False,
+        "no_bpf_filters": True,
+    }
+
+
+async def test_get_reachability_forwards_targets():
+    from unittest.mock import AsyncMock, MagicMock
+
+    from wlanpi_mcp._compat import FastMCP
+    from wlanpi_mcp.tools.utils import register
+
+    mock_client = MagicMock()
+    mock_client.get = AsyncMock(return_value={})
+
+    mcp = FastMCP("test")
+    register(mcp, mock_client)
+    tool = mcp._tool_manager._tools["get_reachability"]
+
+    await tool.run({"targets": ["8.8.8.8", "1.1.1.1"]})
+    assert mock_client.get.call_args.kwargs["params"] == {
+        "targets": ["8.8.8.8", "1.1.1.1"]
+    }
+
+    await tool.run({})
+    assert mock_client.get.call_args.kwargs["params"] is None
 
 
 # ── Bluetooth ─────────────────────────────────────────────────────────────────

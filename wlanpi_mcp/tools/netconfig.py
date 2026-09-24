@@ -45,10 +45,16 @@ def register(mcp: FastMCP, client: CoreClient) -> None:
 
         config: {id, namespaces?: [...], roots?: [...]}. id may not be default,
         root, status, leftovers or reset in any case (400).
-        Each entry: mode ('managed'|'monitor'), iface_display_name, phy (e.g.
-        'phy0'; advisory), interface (e.g. 'wlan0'), namespace (namespaces
-        only), optional default_route, autostart_app, and security {ssid,
-        security: WPA2-PSK|WPA3-PSK|OPEN|OWE, psk?}.
+        Each entry: mode ('managed'|'monitor', default managed),
+        iface_display_name, phy (e.g. 'phy0'; advisory), interface (e.g.
+        'wlan0'), namespace (namespaces only), and optional default_route
+        (bool, default false), mlo (bool, default false: enable Wi-Fi 7
+        multi-link operation; needs an MLO-capable adapter and AP),
+        autostart_app (name defined in core's apps file) and security {ssid,
+        security: WPA2-PSK|WPA3-PSK|OPEN|OWE, psk?}. The security block also
+        accepts sae_pwe, pmf, identity, password, client_cert, private_key
+        and ca_cert, but core does not apply them today: PMF is fixed by the
+        security type and there is no EAP security type - don't set them.
         Rejected with 422: WPA2-PSK psk not 8-63 printable ASCII or 64 hex;
         WPA3-PSK psk not a passphrase (no 64-hex); two entries with the same
         interface; a display name equal to another entry's interface; a
@@ -70,7 +76,8 @@ def register(mcp: FastMCP, client: CoreClient) -> None:
         matched by (namespace, interface), so an entry from get_network_config
         can be sent back as is. If you change an entry's interface or
         namespace, the secret is not carried over: ask the user for it.
-        Same validation as create_network_config (422).
+        Entries take the same fields as create_network_config (including
+        mlo) and the same validation (422).
 
         Args:
             id: Configuration profile ID to update

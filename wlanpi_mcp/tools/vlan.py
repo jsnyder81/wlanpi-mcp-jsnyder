@@ -41,9 +41,14 @@ def register(mcp: FastMCP, client: CoreClient) -> None:
         Args:
             interface: Ethernet interface (e.g. 'eth0'). Cannot be 'all'.
             vlan_id: VLAN ID (1-4094)
-            addresses: Optional list of IP addresses to assign, each a dict with
-                       'family' (4 or 6), 'local' (IP string), and 'prefixlen' (int).
-                       Example: [{"family": 4, "local": "192.168.10.1", "prefixlen": 24}]
+            addresses: Optional list of IP addresses to assign. Each is a dict
+                       with 'family' ('inet' or 'inet6', required), 'local'
+                       (IP string) and 'prefixlen' (int); optional 'dynamic'
+                       (true = run DHCP on the VLAN instead of a static
+                       address), 'broadcast', 'anycast', 'scope' (default
+                       'global'), 'label', 'valid_life_time' and
+                       'preferred_life_time' (seconds).
+                       Example: [{"family": "inet", "local": "192.168.10.1", "prefixlen": 24}]
         """
         body = addresses or []
         return await client.post(
