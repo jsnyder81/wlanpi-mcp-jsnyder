@@ -19,6 +19,8 @@ core capture WebSocket: no local subprocess, no other transport, same JWT.
 
 import asyncio
 import base64
+import contextlib
+import functools
 import glob
 import hashlib
 import logging
@@ -29,13 +31,13 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import BlobResourceContents, EmbeddedResource
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response
 
-from wlanpi_mcp import download_links
+from wlanpi_mcp import download_links, tasks
 from wlanpi_mcp.capture import storage
 from wlanpi_mcp.capture.ws_client import (
     CaptureError,
@@ -91,6 +93,9 @@ class FileCapture:
     error: str | None = None
     ended_at: float | None = None
     channel_issues: list[dict[str, Any]] = field(default_factory=list)
+    # Set when the capture was started as an MCP task (issue #90); the run
+    # path publishes the outcome there instead of only into _CAPTURES.
+    task_record: tasks.TaskRecord | None = None
 
     def to_result(self) -> dict[str, Any]:
         """Return the capture's public state as a JSON-safe result dict."""
@@ -221,6 +226,41 @@ async def _run_file_capture(
             log.debug("best-effort stop failed: %r", exc)
         await sock.close()
         entry.ended_at = time.time()
+        _publish_task_outcome(entry)
+
+
+def _publish_task_outcome(entry: FileCapture) -> None:
+    """Hand a finished capture to its task record, if it was started as one."""
+    record = entry.task_record
+    if record is None:
+        return
+    result = entry.to_result()
+    if record.cancel_requested or entry.status == "cancelled":
+        tasks.TASKS.cancelled(record, result)
+    elif entry.status == "error":
+        tasks.TASKS.fail(record, result)
+    else:
+        tasks.TASKS.complete(record, result)
+
+
+def _progress_message(entry: FileCapture) -> str:
+    """Live statusMessage for a task-backed capture: bytes written so far."""
+    return f"{entry.bytes_written} bytes written to {os.path.basename(entry.path)}"
+
+
+async def _stop_for_cancel(entry: FileCapture) -> None:
+    """Stop a capture through its normal end path so the ownership rule holds.
+
+    Awaiting the run task means the store's cancel returns only once the
+    finally block above has stopped the core session and published the
+    outcome.
+    """
+    entry.stop_event.set()
+    if entry.task is not None:
+        # A capture task cancelled by loop shutdown is already ending: the
+        # tasks/cancel request must not fail on top of it.
+        with contextlib.suppress(asyncio.CancelledError):
+            await entry.task
 
 
 def _prune_tickets(now: float) -> None:
@@ -257,6 +297,7 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
         dwell_ms: int = 250,
         duration_s: int = 60,
         pcap_filter: str = "",
+        ctx: Context[Any, Any] | None = None,
     ) -> dict[str, Any]:
         """
         Start a background, non-streaming packet capture to a pcapng file.
@@ -272,6 +313,12 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
         its own until duration_s elapses or you call stop_pcap_file. Retrieve
         the file with fetch_pcap_file(capture_id=...) (a pcapng blob) once it
         has stopped.
+
+        When your client supports MCP Tasks this call instead returns a task
+        handle right away: the capture runs until duration_s elapses or you
+        cancel the task, tasks/get reports the bytes written so far and, once
+        terminal, the final capture report (capture_id, path, size_bytes,
+        status). Without task support everything above is exactly as before.
 
         This tool always owns the interface. If a capture is already running on
         it, this returns an error rather than taking it over — watch that one
@@ -364,11 +411,27 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
                 config=sock.session_config
                 or {"interfaces": config, "pcap_filter": pcap_filter or ""},
             )
+            if tasks.tasks_supported(ctx):
+                entry.task_record = tasks.TASKS.create(
+                    progress=functools.partial(_progress_message, entry),
+                    cancel=functools.partial(_stop_for_cancel, entry),
+                )
             entry.task = asyncio.create_task(_run_file_capture(entry, sock, fileobj))
             _CAPTURES[session_id] = entry
             spawned = True
 
             result = entry.to_result()
+            if entry.task_record is not None:
+                return tasks.task_call_result(
+                    entry.task_record,
+                    message=(
+                        f"capturing to {path} for up to {duration_s}s as task "
+                        f"'{entry.task_record.task_id}'; poll tasks/get with that "
+                        "taskId for progress and the final capture report, or "
+                        "tasks/cancel to stop it early"
+                    ),
+                    payload=result,
+                )
             result["message"] = (
                 f"capturing to {path} for up to {duration_s}s; fetch it with "
                 f"fetch_pcap_file(capture_id='{session_id}') once stopped"

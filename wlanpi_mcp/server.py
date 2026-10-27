@@ -13,6 +13,7 @@ from wlanpi_mcp.resources import mode as mode_res
 from wlanpi_mcp.resources import netconfig as netconfig_res
 from wlanpi_mcp.resources import network as net_res
 from wlanpi_mcp.resources import profiler as profiler_res
+from wlanpi_mcp.tasks import TasksExtension
 from wlanpi_mcp.tools import (
     advanced,
     bluetooth,
@@ -40,6 +41,9 @@ def create_server(client: CoreClient) -> MCPServer:
             "profiler control, and diagnostics."
         ),
         version=__version__,
+        # Long-running tools may answer with a task handle; see
+        # wlanpi_mcp/tasks.py for what that serves.
+        extensions=[TasksExtension()],
     )
 
     # Phase 1 — system, network, utils
