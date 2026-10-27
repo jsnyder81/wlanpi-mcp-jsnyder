@@ -2,11 +2,12 @@
 
 from typing import Any
 
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Context, MCPServer
+from mcp.types import InputRequiredResult
 
 from wlanpi_mcp.client.core_client import CoreClient
 from wlanpi_mcp.config import get_settings
-from wlanpi_mcp.tools import hints
+from wlanpi_mcp.tools import confirms, hints
 
 
 def register(mcp: MCPServer, client: CoreClient) -> None:
@@ -122,11 +123,15 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
         return await client.post("/api/v1/system/timezone/auto")
 
     @mcp.tool(annotations=hints.DESTRUCTIVE)
-    async def reboot_device() -> dict[str, Any]:
+    async def reboot_device(
+        ctx: Context[Any, Any],
+    ) -> dict[str, Any] | InputRequiredResult:
         """
-        Reboot the WLAN Pi immediately.
+        Reboot the WLAN Pi.
 
-        Active sessions and captures will be interrupted. Can be disabled via
+        The server asks the user to confirm over the MCP channel before
+        rebooting, so do not ask "are you sure" yourself. Active sessions and
+        captures will be interrupted. Can be disabled via
         ALLOW_POWER_CONTROL=false in the server config.
         """
         if not get_settings().ALLOW_POWER_CONTROL:
@@ -134,14 +139,24 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
                 "error": "Power control is disabled. Set ALLOW_POWER_CONTROL=true "
                 "in /etc/wlanpi-mcp/config.env to allow reboot/shutdown."
             }
+        gate = confirms.confirm_gate(
+            ctx,
+            "Reboot the WLAN Pi now? Active captures and sessions will be interrupted.",
+        )
+        if gate is not None:
+            return gate
         return await client.post("/api/v1/system/reboot")
 
     @mcp.tool(annotations=hints.DESTRUCTIVE)
-    async def shutdown_device() -> dict[str, Any]:
+    async def shutdown_device(
+        ctx: Context[Any, Any],
+    ) -> dict[str, Any] | InputRequiredResult:
         """
-        Shut down the WLAN Pi immediately.
+        Shut down the WLAN Pi.
 
-        The device must be powered back on manually. Can be disabled via
+        The server asks the user to confirm over the MCP channel before
+        shutting down, so do not ask "are you sure" yourself. The device must
+        be powered back on manually. Can be disabled via
         ALLOW_POWER_CONTROL=false in the server config.
         """
         if not get_settings().ALLOW_POWER_CONTROL:
@@ -149,6 +164,12 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
                 "error": "Power control is disabled. Set ALLOW_POWER_CONTROL=true "
                 "in /etc/wlanpi-mcp/config.env to allow reboot/shutdown."
             }
+        gate = confirms.confirm_gate(
+            ctx,
+            "Shut down the WLAN Pi now? It must be powered back on manually.",
+        )
+        if gate is not None:
+            return gate
         return await client.post("/api/v1/system/shutdown")
 
     @mcp.tool(annotations=hints.READ_ONLY)

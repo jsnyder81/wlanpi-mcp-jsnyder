@@ -2,10 +2,11 @@
 
 from typing import Any
 
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Context, MCPServer
+from mcp.types import InputRequiredResult
 
 from wlanpi_mcp.client.core_client import CoreClient
-from wlanpi_mcp.tools import hints
+from wlanpi_mcp.tools import confirms, hints
 
 
 def register(mcp: MCPServer, client: CoreClient) -> None:
@@ -116,13 +117,16 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
         return await client.post("/api/v1/profiler/stop")
 
     @mcp.tool(annotations=hints.DESTRUCTIVE)
-    async def purge_profiler_data() -> dict[str, Any]:
+    async def purge_profiler_data(
+        ctx: Context[Any, Any],
+    ) -> dict[str, Any] | InputRequiredResult:
         """
         Delete every profiler client profile, capture and session report.
 
-        This cannot be undone. Always confirm with the user first, and only
-        call it when they asked to clear the profiler's saved data - never as
-        cleanup after a profiling run.
+        This cannot be undone. The server asks the user to confirm over the
+        MCP channel before deleting, so do not ask "are you sure" yourself.
+        Only call it when they asked to clear the profiler's saved data, never
+        as cleanup after a profiling run.
 
         Returns {"files": N, "bytes": N}: how many files and symlinks were
         removed and their total size.
@@ -131,4 +135,11 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
         it (stop_profiler) and wait for get_profiler_status to show it stopped,
         then retry.
         """
+        gate = confirms.confirm_gate(
+            ctx,
+            "Delete every profiler client profile, capture and session report? "
+            "This cannot be undone.",
+        )
+        if gate is not None:
+            return gate
         return await client.post("/api/v1/profiler/purge")
