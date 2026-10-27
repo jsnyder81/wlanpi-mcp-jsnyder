@@ -2,10 +2,11 @@
 
 from typing import Any, NotRequired, TypedDict
 
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Context, MCPServer
+from mcp.types import InputRequiredResult
 
 from wlanpi_mcp.client.core_client import CoreClient
-from wlanpi_mcp.tools import hints
+from wlanpi_mcp.tools import confirms, hints
 
 
 # Top-level shape of wlanpi-core's NetConfig / NetConfigUpdate. Typed so the
@@ -176,17 +177,31 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
         )
 
     @mcp.tool(annotations=hints.DESTRUCTIVE)
-    async def delete_network_config(id: str, force: bool = False) -> dict[str, Any]:
+    async def delete_network_config(
+        id: str,
+        ctx: Context[Any, Any],
+        force: bool = False,
+    ) -> dict[str, Any] | InputRequiredResult:
         """
         Delete a saved profile.
 
         Deleting the active profile is 409 unless force is set, which
-        deactivates it first. 409 also means another change is running (retry).
+        deactivates it first. When force is set, the server asks the user to
+        confirm over the MCP channel first, so do not ask "are you sure"
+        yourself. 409 also means another change is running (retry).
 
         Args:
             id: Configuration profile ID to delete
             force: Deactivate and delete the profile even if it is active
         """
+        if force:
+            gate = confirms.confirm_gate(
+                ctx,
+                f"Delete network config '{id}' now? If it is active, it is "
+                "deactivated first, taking down its interfaces.",
+            )
+            if gate is not None:
+                return gate
         return await client.delete(
             f"/api/v1/network/config/{id}",
             params={"force": force},
@@ -203,15 +218,20 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
         return await client.get("/api/v1/network/config/leftovers")
 
     @mcp.tool(annotations=hints.DESTRUCTIVE)
-    async def reset_network_namespaces(namespaces: list[str]) -> dict[str, Any]:
+    async def reset_network_namespaces(
+        namespaces: list[str],
+        ctx: Context[Any, Any],
+    ) -> dict[str, Any] | InputRequiredResult:
         """
         DESTRUCTIVE: clear the named namespaces, including other tools' ones.
 
+        The server asks the user to confirm over the MCP channel before
+        clearing, so do not ask "are you sure" yourself. Still pass only
+        namespaces the user named (from left_alone or
+        list_network_leftovers): never pick names yourself or reuse an
+        earlier approval.
         Returns every radio in them to root and deletes each once empty.
-        Always confirm with the user first: list the exact namespaces (from
-        left_alone or list_network_leftovers) and call only after they approve
-        those names in this conversation. Never pick names yourself or reuse
-        an earlier approval. Refusals are
+        Refusals are
         per-entry in results[].detail (e.g. in use by the active profile:
         deactivate it first). It does not free a radio another tool holds in
         root (e.g. profiler on wlan0): the user must stop that tool.
@@ -221,6 +241,18 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
         Args:
             namespaces: Namespace names the user confirmed for reset
         """
+        # Quote each name and cap the list so a hostile or mistaken
+        # namespaces value cannot stuff the confirm prompt.
+        shown = ", ".join(f"'{name}'" for name in namespaces[:5])
+        if len(namespaces) > 5:
+            shown += f", and {len(namespaces) - 5} more"
+        gate = confirms.confirm_gate(
+            ctx,
+            f"Reset namespaces {shown} now? Every radio in them returns to "
+            "root and each namespace is deleted once empty.",
+        )
+        if gate is not None:
+            return gate
         return await client.post(
             "/api/v1/network/config/reset", json={"namespaces": namespaces}
         )

@@ -49,6 +49,19 @@ ADDITIVE = {
     "create_network_config",
 }
 
+# Tools the server gates with an elicitation confirm (#88). The Pi owns
+# these confirms, so the browser extension must not double-confirm; every
+# entry must also be DESTRUCTIVE, and a new destructive tool must be added
+# here or justified by omission.
+CONFIRMED = {
+    "reboot_device",
+    "shutdown_device",
+    "purge_profiler_data",
+    "delete_network_config",  # only when force=true
+    "reset_network_namespaces",
+    "set_regulatory_domain",
+}
+
 
 @pytest.fixture(scope="module")
 def tools():
@@ -72,3 +85,7 @@ def test_every_tool_has_its_class(tools):
     }
     wrong = {n: t.annotations for n, t in tools.items() if t.annotations != expected[n]}
     assert wrong == {}
+
+
+def test_confirmed_tools_are_destructive():
+    assert CONFIRMED - DESTRUCTIVE == set()
