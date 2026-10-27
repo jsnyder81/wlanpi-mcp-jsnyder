@@ -3,13 +3,14 @@
 import asyncio
 import base64
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock
 
 import httpx
 import pytest
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
-from mcp.types import CallToolResult, EmbeddedResource
+from mcp.types import CallToolResult, ClientCapabilities, EmbeddedResource
 
 from tests.test_capture_tools import (
     AUTH_OK,
@@ -23,11 +24,22 @@ from tests.test_capture_tools import (
     sessions_event,
     started_event,
 )
+from wlanpi_mcp import tasks
 from wlanpi_mcp.capture import storage
 from wlanpi_mcp.capture.ws_client import CaptureSocket
 from wlanpi_mcp.client.core_client import CoreAPIError
 from wlanpi_mcp.config import Settings
 from wlanpi_mcp.tools import capture_file
+
+TASK_CAPS = ClientCapabilities(extensions={tasks.TASKS_EXTENSION_ID: {}})
+
+
+def _task_ctx(capable: bool) -> Context[Any, Any]:
+    """Fake a Context whose client either declares the tasks extension or not."""
+    ctx = MagicMock(spec=Context)
+    ctx.client_capabilities = TASK_CAPS if capable else ClientCapabilities()
+    ctx.protocol_version = "2026-07-28"
+    return ctx
 
 
 class BlockingWS(StubWS):
@@ -48,6 +60,7 @@ class BlockingWS(StubWS):
 @pytest.fixture(autouse=True)
 async def _clean_registry():
     capture_file._CAPTURES.clear()
+    tasks.TASKS.clear()
     yield
     for entry in list(capture_file._CAPTURES.values()):
         task = entry.task
@@ -58,6 +71,7 @@ async def _clean_registry():
             except BaseException:  # noqa: BLE001 - teardown swallows everything
                 pass
     capture_file._CAPTURES.clear()
+    tasks.TASKS.clear()
 
 
 @pytest.fixture
@@ -171,6 +185,152 @@ async def test_invalid_width_is_rejected_before_connecting(capdir):
 
     assert "20" in result["error"]
     assert stub.sent == []
+
+
+# ── start_pcap_file as an MCP task (#90) ─────────────────────────────────────
+
+
+async def test_start_as_task_returns_a_task_and_completes(capdir):
+    _tmp, use = capdir
+    use(
+        StubWS(
+            [
+                AUTH_OK,
+                sessions_event(),
+                CONFIG_APPLIED,
+                started_event("cap_tk"),
+                *pcapng_chunks(BEACON_A),
+                CAPTURE_ENDED,
+            ]
+        )
+    )
+    tools = _register()
+    result = await tools["start_pcap_file"].run(
+        {"channels": [6], "duration_s": 30}, _task_ctx(capable=True)
+    )
+
+    assert isinstance(result, tasks.TaskCallResult)
+    assert result.result_type == "task"
+    assert result.status == "working"
+    assert result.structured_content["capture_id"] == "cap_tk"
+    record = tasks.TASKS.get(result.task_id)
+    assert record is not None
+
+    entry = await _await_capture("cap_tk")
+    assert record.status == "completed"
+    assert record.result["capture_id"] == "cap_tk"
+    assert record.result["size_bytes"] == entry.bytes_written > 0
+
+
+async def test_task_progress_reports_bytes_written(capdir):
+    _tmp, use = capdir
+    use(
+        BlockingWS(
+            [
+                AUTH_OK,
+                sessions_event(),
+                CONFIG_APPLIED,
+                started_event("cap_tkp"),
+                *pcapng_chunks(BEACON_A),
+            ]
+        )
+    )
+    tools = _register()
+    result = await tools["start_pcap_file"].run(
+        {"channels": [6], "duration_s": 30}, _task_ctx(capable=True)
+    )
+    record = tasks.TASKS.get(result.task_id)
+    entry = capture_file._CAPTURES["cap_tkp"]
+    # Let the background task run until it has drained the delivered chunks
+    # and parked waiting for more: cooperative yields, no wall-clock wait.
+    while not entry.bytes_written:
+        await asyncio.sleep(0)
+
+    # While working, tasks/get reports the bytes written so far.
+    assert f"{entry.bytes_written} bytes written" in tasks.wire(record)["statusMessage"]
+
+    # stop_pcap_file ends the capture; the run path publishes the outcome.
+    await tools["stop_pcap_file"].fn(capture_id="cap_tkp")
+    assert record.status == "completed"
+    assert record.result["status"] == "stopped"
+    assert record.result["bytes_written"] > 0
+
+
+def test_task_publish_maps_a_failed_capture_to_a_failed_task():
+    # consume_raw treats a dropped stream as a normal end, so an errored run
+    # is rare over the socket; pin the mapping directly instead.
+    entry = capture_file.FileCapture(
+        session_id="cap_tke",
+        interface="wlanpi0",
+        path="/tmp/does-not-exist.pcapng",
+        duration_s=1,
+        started_at=0.0,
+        stop_event=asyncio.Event(),
+        status="error",
+        error="OSError: disk full",
+    )
+    record = tasks.TASKS.create()
+    entry.task_record = record
+
+    capture_file._publish_task_outcome(entry)
+    assert record.status == "failed"
+    assert record.result["error"] == "OSError: disk full"
+
+
+async def test_task_cancel_stops_the_capture(capdir):
+    _tmp, use = capdir
+    stub = use(
+        BlockingWS(
+            [
+                AUTH_OK,
+                sessions_event(),
+                CONFIG_APPLIED,
+                started_event("cap_tkc"),
+                *pcapng_chunks(BEACON_A),
+            ]
+        )
+    )
+    tools = _register()
+    result = await tools["start_pcap_file"].run(
+        {"channels": [6], "duration_s": 30}, _task_ctx(capable=True)
+    )
+    record = tasks.TASKS.get(result.task_id)
+
+    await tasks.TASKS.cancel(record)
+    assert record.status == "cancelled"
+    assert record.result["capture_id"] == "cap_tkc"
+    # The ownership rule holds: the cancel went through the run path, which
+    # stopped the core session and closed the socket.
+    assert "stop" in stub.commands
+    assert stub.closed is True
+
+
+async def test_start_without_task_support_returns_the_plain_report(capdir):
+    _tmp, use = capdir
+    use(
+        StubWS(
+            [
+                AUTH_OK,
+                sessions_event(),
+                CONFIG_APPLIED,
+                started_event("cap_nt"),
+                *pcapng_chunks(BEACON_A),
+                CAPTURE_ENDED,
+            ]
+        )
+    )
+    tools = _register()
+    result = await tools["start_pcap_file"].run(
+        {"channels": [6], "duration_s": 30}, _task_ctx(capable=False)
+    )
+
+    assert isinstance(result, dict)
+    assert result["capture_id"] == "cap_nt"
+    assert "message" in result
+    # The gate pins it: no task is ever created for a client that cannot
+    # parse the result type.
+    assert len(tasks.TASKS) == 0
+    await _await_capture("cap_nt")
 
 
 # ── stop_pcap_file ───────────────────────────────────────────────────────────
