@@ -1,11 +1,16 @@
 """MCP tools for managing saved network configuration profiles."""
 
+import re
 from typing import Any, NotRequired, TypedDict
 
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.types import InputRequiredResult
 
-from wlanpi_mcp.client.core_client import CoreClient
+from wlanpi_mcp.client.core_client import (
+    CoreAPIError,
+    CoreClient,
+    CoreUnavailableError,
+)
 from wlanpi_mcp.tools import confirms, hints
 
 
@@ -27,6 +32,98 @@ class NetConfigUpdate(TypedDict, total=False):
 
     namespaces: list[dict[str, Any]] | None
     roots: list[dict[str, Any]] | None
+
+
+# Core's confirmable 409s are plain ConfigActiveError strings (verified
+# against wlanpi-core main, 2026-10): activate refuses with "Another
+# configuration is currently active: <id>." or "Configuration <id> is
+# already active.", deactivate with "Configuration <id> is not active."
+# Match on wording, not status alone: the busy and manual-mode 409s must
+# keep raising untouched. If core's phrasing drifts, name extraction falls
+# back to generic wording; if even the match phrases go, the 409 degrades
+# to surfacing the error, never to a confirm on the wrong refusal.
+_ACTIVE_PROFILE_RE = re.compile(r"currently active: (.+)")
+
+
+def _is_replace_active_409(exc: CoreAPIError) -> bool:
+    """Whether core refused an activate because a profile is in the way."""
+    detail = _detail_text(exc)
+    return exc.status_code == 409 and (
+        "currently active" in detail or "is already active" in detail
+    )
+
+
+def _is_not_active_409(exc: CoreAPIError) -> bool:
+    """Whether core refused a deactivate because this profile is not active."""
+    return exc.status_code == 409 and "is not active" in _detail_text(exc)
+
+
+def _detail_text(exc: CoreAPIError) -> str:
+    """Core's error detail as text for the matchers, '' if not a message."""
+    return exc.detail if isinstance(exc.detail, str) else ""
+
+
+def _active_profile_named(detail: str) -> str | None:
+    """Return the active profile core named in a replace-409, None if unparseable."""
+    match = _ACTIVE_PROFILE_RE.search(detail)
+    return match.group(1).rstrip(".") if match else None
+
+
+async def _active_profile(client: CoreClient) -> str | None:
+    """Name the active profile for a confirm message, None if not knowable.
+
+    The deactivate 409 names only the target, so ask the list endpoint
+    (id to active state). Cosmetic: any failure drops the name from the
+    message.
+    """
+    try:
+        configs = await client.get("/api/v1/network/config/")
+    except (CoreAPIError, CoreUnavailableError):
+        return None
+    if isinstance(configs, dict):
+        for name, active in configs.items():
+            if active is True:
+                return str(name)
+    return None
+
+
+def _declined(detail: Any) -> dict[str, Any]:
+    """Return the decline result: core's 409 detail, plus what did not happen."""
+    return {
+        "performed": False,
+        "reason": "user declined or dismissed",
+        "detail": detail,
+    }
+
+
+def _activate_message(id: str, detail: str) -> str:
+    """Build the activate confirm, naming the active and target profiles."""
+    if "is already active" in detail:
+        return (
+            f"Activate '{id}' now? It is already active; activating again "
+            "tears it down and re-applies it."
+        )
+    active = _active_profile_named(detail)
+    if active is None:
+        return (
+            f"Activate '{id}' now? Another profile is currently active. "
+            f"Activating '{id}' deactivates it first, taking down its "
+            "interfaces."
+        )
+    return (
+        f"Activate '{id}' now? Profile '{active}' is currently active. "
+        f"Activating '{id}' deactivates '{active}' first, taking down its "
+        "interfaces."
+    )
+
+
+def _deactivate_message(id: str, active: str | None) -> str:
+    """Build the deactivate confirm, naming the active and target profiles."""
+    named = f" ('{active}' is)" if active is not None else ""
+    return (
+        f"Deactivate '{id}' now? It is not the active profile{named}. "
+        "Deactivating it anyway makes 'default' current."
+    )
 
 
 def register(mcp: MCPServer, client: CoreClient) -> None:
@@ -115,14 +212,19 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
 
     @mcp.tool(annotations=hints.DESTRUCTIVE)
     async def activate_network_config(
-        id: str, override_active: bool = False
-    ) -> dict[str, Any]:
+        id: str, ctx: Context[Any, Any], override_active: bool = False
+    ) -> dict[str, Any] | InputRequiredResult:
         """
         Activate a saved profile.
 
-        Always call with override_active=false first. Never set it true on
-        your own: if another profile is active, ask the user whether to replace
-        it, even if they already asked to activate this one.
+        Always call with override_active=false. On a client that can
+        answer confirms the server enforces this: it drops a true you
+        set, and when a profile is in the way Core refuses with 409 and
+        the server asks the user to confirm over the MCP channel,
+        retrying with override_active=true on accept, so do not ask "are
+        you sure" yourself. A client that cannot answer gets the 409:
+        ask the user, and set override_active=true only after they
+        agree. Never set it true on your own.
         Success does NOT mean every entry was applied: tell the user each
         outcomes[] entry's interface, status and detail.
         connected/provisioned: applied (provisioned with detail "does not
@@ -142,39 +244,109 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
         404: no such profile.
         409: another change is running (nothing changed; retry
         shortly), WLAN_MANAGEMENT=manual (Core is not managing Wi-Fi; tell the
-        user), or a profile is already active (ask the user before retrying
-        with override_active=true).
+        user), or a profile is already active (the server confirms that one
+        itself when the client can answer; otherwise ask the user before
+        retrying with override_active=true).
 
         Args:
             id: Configuration profile ID to activate
-            override_active: Tear down the active profile first; only after the user confirms
+            override_active: Tear down the active profile first; the server
+                sets this after the user confirms, so pass false
         """
-        return await client.post(
-            f"/api/v1/network/config/activate/{id}",
-            params={"override_active": override_active},
-        )
+        resume = confirms.resume_with_state(ctx)
+        if (
+            resume is not None
+            and resume[1].get("op") == "activate"
+            and resume[1].get("id") == id
+        ):
+            accepted, state = resume
+            if not accepted:
+                return state["result"]
+            override_active = True
+        elif confirms.form_elicitations_supported(ctx):
+            # The confirm is protocol-owned: an override_active the model
+            # set itself must not skip it. Core only refuses when asked
+            # without the override, so drop it and let the 409 drive the
+            # ask. Clients that cannot answer keep today's behavior.
+            override_active = False
+        try:
+            return await client.post(
+                f"/api/v1/network/config/activate/{id}",
+                params={"override_active": override_active},
+            )
+        except CoreAPIError as exc:
+            if not _is_replace_active_409(exc):
+                raise
+            ask = confirms.confirm_with_state(
+                ctx,
+                _activate_message(id, _detail_text(exc)),
+                {"op": "activate", "id": id, "result": _declined(exc.detail)},
+            )
+            if ask is None:
+                raise
+            return ask
 
     @mcp.tool(annotations=hints.DESTRUCTIVE)
     async def deactivate_network_config(
-        id: str, override_active: bool = False
-    ) -> dict[str, Any]:
+        id: str, ctx: Context[Any, Any], override_active: bool = False
+    ) -> dict[str, Any] | InputRequiredResult:
         """
         Deactivate the active profile; 'default' becomes current.
 
         Only what Core set up is reverted. left_alone lists namespaces still
         holding radios that Core did not remove: show them to the user, and
         offer reset_network_namespaces only if the user asks to clear them.
-        Errors: 404 no such profile; 409 busy (retry), not the active profile,
+        Always call with override_active=false. When the named profile is
+        not the active one, Core refuses with 409 and the server asks the
+        user to confirm deactivating it anyway, retrying with
+        override_active=true on accept, so do not ask "are you sure"
+        yourself. On a client that can answer confirms the server enforces
+        this: it drops a true you set. A client that cannot answer gets
+        the 409: ask the user first.
+        Errors: 404 no such profile; 409 busy (retry), not the active
+        profile (the server confirms that one where the client can answer),
         or WLAN_MANAGEMENT=manual.
 
         Args:
             id: Configuration profile ID to deactivate
-            override_active: Deactivate even if this profile is not the active one
+            override_active: Deactivate even if this profile is not the
+                active one; the server sets this after the user confirms,
+                so pass false
         """
-        return await client.post(
-            f"/api/v1/network/config/deactivate/{id}",
-            params={"override_active": override_active},
-        )
+        resume = confirms.resume_with_state(ctx)
+        if (
+            resume is not None
+            and resume[1].get("op") == "deactivate"
+            and resume[1].get("id") == id
+        ):
+            accepted, state = resume
+            if not accepted:
+                return state["result"]
+            override_active = True
+        elif confirms.form_elicitations_supported(ctx):
+            # The confirm is protocol-owned: an override_active the model
+            # set itself must not skip it. Core only refuses when asked
+            # without the override, so drop it and let the 409 drive the
+            # ask. Clients that cannot answer keep today's behavior.
+            override_active = False
+        try:
+            return await client.post(
+                f"/api/v1/network/config/deactivate/{id}",
+                params={"override_active": override_active},
+            )
+        except CoreAPIError as exc:
+            if not _is_not_active_409(exc):
+                raise
+            if not confirms.form_elicitations_supported(ctx):
+                raise
+            ask = confirms.confirm_with_state(
+                ctx,
+                _deactivate_message(id, await _active_profile(client)),
+                {"op": "deactivate", "id": id, "result": _declined(exc.detail)},
+            )
+            if ask is None:
+                raise
+            return ask
 
     @mcp.tool(annotations=hints.DESTRUCTIVE)
     async def delete_network_config(

@@ -1,5 +1,5 @@
 """
-Elicitation confirms for destructive tools (#88).
+Elicitation confirms: pre-action (#88) and mid-flow override_active (#86).
 
 A client that declares form elicitation gets a protocol-level confirm before
 anything destructive runs; every other client sees the pre-#88 behavior
@@ -11,8 +11,10 @@ tools.
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 from mcp.server.mcpserver import Context, MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import (
     ClientCapabilities,
     ElicitationCapability,
@@ -22,11 +24,14 @@ from mcp.types import (
     UrlElicitationCapability,
 )
 
+from wlanpi_mcp.client.core_client import CoreAPIError
 from wlanpi_mcp.tools import netconfig, system
 from wlanpi_mcp.tools.confirms import (
+    _REQUEST_STATE,
     CONFIRM_KEY,
     confirm_gate,
     form_elicitations_supported,
+    resume_with_state,
 )
 
 FORM_CAPS = ClientCapabilities(
@@ -271,3 +276,298 @@ async def test_reset_namespaces_message_quotes_and_caps_names():
     assert "'ns0'" in message and "'ns4'" in message
     assert "'ns5'" not in message
     assert "and 3 more" in message
+
+
+# ── mid-flow override_active confirms (#86) ──────────────────────────────────
+
+# Core's ConfigActiveError strings, verified against wlanpi-core main.
+ACTIVE_409 = "Another configuration is currently active: office."
+NOT_ACTIVE_409 = "Configuration lab is not active."
+BUSY_409 = "Another network configuration change is in progress; try again."
+ALREADY_409 = "Configuration lab is already active."
+
+
+def _409(detail):
+    """Build a CoreAPIError as the activate/deactivate routes raise it: 409 JSON."""
+    response = httpx.Response(
+        409,
+        json={"detail": detail},
+        request=httpx.Request("POST", "https://localhost:31415/api/v1/network"),
+    )
+    return CoreAPIError(response)
+
+
+def _refusing_core(refusal, success):
+    """Return a fake core that refuses without the override and answers with it."""
+
+    async def post(path, params=None, **kwargs):
+        if params and params.get("override_active"):
+            return success
+        raise refusal
+
+    core = MagicMock()
+    core.post = AsyncMock(side_effect=post)
+    core.get = AsyncMock(return_value={})
+    return core
+
+
+def _declined_ctx(first, action):
+    return _ctx(
+        FORM_CAPS, {CONFIRM_KEY: ElicitResult(action=action)}, state=first.request_state
+    )
+
+
+def test_resume_state_ignores_foreign_states():
+    responses = {CONFIRM_KEY: ElicitResult(action="accept", content={"confirm": True})}
+    # confirm_gate's constant, a marked-less JSON dict, junk, and no state
+    # at all are not our retries.
+    assert resume_with_state(_ctx(FORM_CAPS, responses, state=_REQUEST_STATE)) is None
+    assert (
+        resume_with_state(_ctx(FORM_CAPS, responses, state='{"op": "activate"}'))
+        is None
+    )
+    assert resume_with_state(_ctx(FORM_CAPS, responses, state="{not json")) is None
+    assert resume_with_state(_ctx(FORM_CAPS, responses)) is None
+
+
+async def test_activate_409_without_capability_is_unchanged():
+    core = _refusing_core(_409(ACTIVE_409), {})
+    tool = _tools(netconfig, core)["activate_network_config"]
+
+    with pytest.raises(ToolError) as err:
+        await tool.run({"id": "lab"}, _ctx(None))
+    assert "409" in str(err.value)
+    core.post.assert_awaited_once_with(
+        "/api/v1/network/config/activate/lab", params={"override_active": False}
+    )
+
+
+async def test_activate_success_with_capability_is_not_confirmed():
+    # No refusal, no ask: a straight success passes through untouched.
+    applied = {"id": "lab", "message": "Configuration activated successfully"}
+    core = MagicMock()
+    core.post = AsyncMock(return_value=applied)
+    tool = _tools(netconfig, core)["activate_network_config"]
+
+    assert await tool.run({"id": "lab"}, _ctx(FORM_CAPS)) == applied
+    core.post.assert_awaited_once_with(
+        "/api/v1/network/config/activate/lab", params={"override_active": False}
+    )
+
+
+async def test_activate_409_asks_naming_both_profiles():
+    core = _refusing_core(_409(ACTIVE_409), {})
+    tool = _tools(netconfig, core)["activate_network_config"]
+
+    first = await tool.run({"id": "lab"}, _ctx(FORM_CAPS))
+    assert isinstance(first, InputRequiredResult)
+    message = first.input_requests[CONFIRM_KEY].params.message
+    assert "'office'" in message and "'lab'" in message
+    core.post.assert_awaited_once()
+
+
+async def test_activate_accept_retries_core_with_override():
+    applied = {"id": "lab", "message": "Configuration activated successfully"}
+    core = _refusing_core(_409(ACTIVE_409), applied)
+    tool = _tools(netconfig, core)["activate_network_config"]
+
+    first = await tool.run({"id": "lab"}, _ctx(FORM_CAPS))
+    retry = _accept()
+    retry.request_state = first.request_state
+    assert await tool.run({"id": "lab"}, retry) == applied
+    assert core.post.await_args_list[1].kwargs["params"] == {"override_active": True}
+
+
+@pytest.mark.parametrize("action", ["decline", "cancel"])
+async def test_activate_decline_returns_409_detail(action):
+    core = _refusing_core(_409(ACTIVE_409), {})
+    tool = _tools(netconfig, core)["activate_network_config"]
+
+    first = await tool.run({"id": "lab"}, _ctx(FORM_CAPS))
+    assert await tool.run({"id": "lab"}, _declined_ctx(first, action)) == {
+        "performed": False,
+        "reason": "user declined or dismissed",
+        "detail": ACTIVE_409,
+    }
+    core.post.assert_awaited_once()
+
+
+async def test_activate_unchecked_box_is_a_decline():
+    core = _refusing_core(_409(ACTIVE_409), {})
+    tool = _tools(netconfig, core)["activate_network_config"]
+
+    first = await tool.run({"id": "lab"}, _ctx(FORM_CAPS))
+    retry = _accept(confirm=False)
+    retry.request_state = first.request_state
+    result = await tool.run({"id": "lab"}, retry)
+    assert result["performed"] is False
+    core.post.assert_awaited_once()
+
+
+async def test_activate_override_true_cannot_skip_the_confirm():
+    # A model that sets override_active itself must not bypass the confirm:
+    # for a capable client the server drops it and lets the 409 drive the
+    # ask, then honors it on the accepted retry.
+    applied = {"id": "lab", "message": "Configuration activated successfully"}
+    core = _refusing_core(_409(ACTIVE_409), applied)
+    tool = _tools(netconfig, core)["activate_network_config"]
+
+    first = await tool.run({"id": "lab", "override_active": True}, _ctx(FORM_CAPS))
+    assert isinstance(first, InputRequiredResult)
+    assert core.post.await_args.kwargs["params"] == {"override_active": False}
+
+    retry = _accept()
+    retry.request_state = first.request_state
+    assert await tool.run({"id": "lab", "override_active": True}, retry) == applied
+    assert core.post.await_args_list[1].kwargs["params"] == {"override_active": True}
+
+
+async def test_activate_other_409s_are_not_confirmed():
+    # The busy refusal must surface as it does today.
+    core = _refusing_core(_409(BUSY_409), {})
+    tool = _tools(netconfig, core)["activate_network_config"]
+
+    with pytest.raises(ToolError):
+        await tool.run({"id": "lab"}, _ctx(FORM_CAPS))
+
+
+async def test_activate_already_active_409_asks_to_reapply():
+    # Re-activating the active profile is a teardown plus re-apply, so it
+    # confirms too rather than dead-ending a downgraded override.
+    applied = {"id": "lab", "message": "Configuration activated successfully"}
+    core = _refusing_core(_409(ALREADY_409), applied)
+    tool = _tools(netconfig, core)["activate_network_config"]
+
+    first = await tool.run({"id": "lab"}, _ctx(FORM_CAPS))
+    assert isinstance(first, InputRequiredResult)
+    message = first.input_requests[CONFIRM_KEY].params.message
+    assert "already active" in message and "'lab'" in message
+
+    retry = _accept()
+    retry.request_state = first.request_state
+    assert await tool.run({"id": "lab"}, retry) == applied
+    assert core.post.await_args_list[1].kwargs["params"] == {"override_active": True}
+
+
+async def test_activate_409_without_a_name_falls_back():
+    # Core phrasing drift: still confirmable, but the message cannot name
+    # the active profile.
+    core = _refusing_core(_409("Another configuration is currently active."), {})
+    tool = _tools(netconfig, core)["activate_network_config"]
+
+    first = await tool.run({"id": "lab"}, _ctx(FORM_CAPS))
+    message = first.input_requests[CONFIRM_KEY].params.message
+    assert "Another profile is currently active" in message
+
+
+async def test_activate_answers_without_a_prior_ask_cannot_skip():
+    core = _refusing_core(_409(ACTIVE_409), {})
+    tool = _tools(netconfig, core)["activate_network_config"]
+
+    responses = {CONFIRM_KEY: ElicitResult(action="accept", content={"confirm": True})}
+    result = await tool.run({"id": "lab"}, _ctx(FORM_CAPS, responses))
+    assert isinstance(result, InputRequiredResult)
+    core.post.assert_awaited_once()
+
+
+async def test_activate_retry_without_answer_reasks():
+    core = _refusing_core(_409(ACTIVE_409), {})
+    tool = _tools(netconfig, core)["activate_network_config"]
+
+    first = await tool.run({"id": "lab"}, _ctx(FORM_CAPS))
+    second = await tool.run({"id": "lab"}, _ctx(FORM_CAPS, None, first.request_state))
+    assert isinstance(second, InputRequiredResult)
+
+
+async def test_deactivate_409_asks_naming_both_profiles():
+    done = {"id": "lab", "message": "Configuration deactivated successfully"}
+    core = _refusing_core(_409(NOT_ACTIVE_409), done)
+    core.get = AsyncMock(return_value={"office": True, "lab": False})
+    tool = _tools(netconfig, core)["deactivate_network_config"]
+
+    first = await tool.run({"id": "lab"}, _ctx(FORM_CAPS))
+    assert isinstance(first, InputRequiredResult)
+    message = first.input_requests[CONFIRM_KEY].params.message
+    assert "'office'" in message and "'lab'" in message
+
+
+async def test_deactivate_accept_retries_core_with_override():
+    done = {"id": "lab", "message": "Configuration deactivated successfully"}
+    core = _refusing_core(_409(NOT_ACTIVE_409), done)
+    core.get = AsyncMock(return_value={"office": True, "lab": False})
+    tool = _tools(netconfig, core)["deactivate_network_config"]
+
+    first = await tool.run({"id": "lab"}, _ctx(FORM_CAPS))
+    retry = _accept()
+    retry.request_state = first.request_state
+    assert await tool.run({"id": "lab"}, retry) == done
+    assert core.post.await_args_list[1].kwargs["params"] == {"override_active": True}
+
+
+async def test_deactivate_override_true_cannot_skip_the_confirm():
+    done = {"id": "lab", "message": "Configuration deactivated successfully"}
+    core = _refusing_core(_409(NOT_ACTIVE_409), done)
+    core.get = AsyncMock(return_value={"office": True, "lab": False})
+    tool = _tools(netconfig, core)["deactivate_network_config"]
+
+    first = await tool.run({"id": "lab", "override_active": True}, _ctx(FORM_CAPS))
+    assert isinstance(first, InputRequiredResult)
+    assert core.post.await_args.kwargs["params"] == {"override_active": False}
+    core.get.assert_awaited_once()
+
+
+async def test_activate_override_true_passes_through_without_capability():
+    # Legacy behavior for clients that cannot answer: the model's override
+    # reaches core untouched.
+    applied = {"id": "lab", "message": "Configuration activated successfully"}
+    core = _refusing_core(_409(ACTIVE_409), applied)
+    tool = _tools(netconfig, core)["activate_network_config"]
+
+    assert await tool.run({"id": "lab", "override_active": True}, _ctx(None)) == applied
+    assert core.post.await_args.kwargs["params"] == {"override_active": True}
+
+
+async def test_deactivate_override_true_passes_through_without_capability():
+    # Legacy behavior for clients that cannot answer: the model's override
+    # reaches core untouched.
+    done = {"id": "lab", "message": "Configuration deactivated successfully"}
+    core = _refusing_core(_409(NOT_ACTIVE_409), done)
+    tool = _tools(netconfig, core)["deactivate_network_config"]
+
+    assert await tool.run({"id": "lab", "override_active": True}, _ctx(None)) == done
+    assert core.post.await_args.kwargs["params"] == {"override_active": True}
+    core.get.assert_not_awaited()
+
+
+async def test_deactivate_decline_returns_409_detail():
+    core = _refusing_core(_409(NOT_ACTIVE_409), {})
+    tool = _tools(netconfig, core)["deactivate_network_config"]
+
+    first = await tool.run({"id": "lab"}, _ctx(FORM_CAPS))
+    assert await tool.run({"id": "lab"}, _declined_ctx(first, "decline")) == {
+        "performed": False,
+        "reason": "user declined or dismissed",
+        "detail": NOT_ACTIVE_409,
+    }
+    core.post.assert_awaited_once()
+
+
+async def test_deactivate_active_lookup_failure_falls_back():
+    # The name lookup is cosmetic: its failure must not eat the confirm.
+    core = _refusing_core(_409(NOT_ACTIVE_409), {})
+    core.get = AsyncMock(side_effect=_409("nope"))
+    tool = _tools(netconfig, core)["deactivate_network_config"]
+
+    first = await tool.run({"id": "lab"}, _ctx(FORM_CAPS))
+    assert isinstance(first, InputRequiredResult)
+    message = first.input_requests[CONFIRM_KEY].params.message
+    assert "'lab'" in message and "is not the active profile." in message
+
+
+async def test_deactivate_409_without_capability_is_unchanged():
+    core = _refusing_core(_409(NOT_ACTIVE_409), {})
+    tool = _tools(netconfig, core)["deactivate_network_config"]
+
+    with pytest.raises(ToolError):
+        await tool.run({"id": "lab"}, _ctx(None))
+    core.get.assert_not_awaited()
