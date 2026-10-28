@@ -61,6 +61,21 @@ class StubWS:
         raise AssertionError(f"{command!r} was never sent; sent {self.commands}")
 
 
+class BlockingWS(StubWS):
+    """Like StubWS but, once its script is exhausted, blocks instead of raising.
+
+    The capture stays 'running' until an early stop trips the poll.
+    """
+
+    async def recv(self):
+        if self.script:
+            item = self.script.pop(0)
+            if isinstance(item, BaseException):
+                raise item
+            return item
+        await asyncio.sleep(3600)
+
+
 def event(code, data=None, event_type="status"):
     return json.dumps(
         {"type": "event", "event": event_type, "code": code, "data": data or {}}
