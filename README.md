@@ -141,6 +141,18 @@ Service management tools (`start_service`, `stop_service`, `restart_service`) ar
 
 Connect a client and list tools/resources for the full, current inventory.
 
+### Confirmations and background tasks
+
+On requests that use MCP protocol revision 2026-07-28, the server uses two client features when the client declares them. Clients without them, such as Claude Desktop or `claude -p`, get the same tools without these features.
+
+- **Elicitation.** The server asks you directly instead of relying on the model to ask:
+  - It confirms before destructive actions: `reboot_device`, `shutdown_device`, `purge_profiler_data`, `set_regulatory_domain`, `reset_network_namespaces`, `delete_network_config` with `force`, and the override cases of `activate_network_config` and `deactivate_network_config`.
+  - It lets you pick the adapter when `scan_wlan` finds several.
+  - For `create_network_config`, it opens a page on the WLAN Pi where you type each Wi-Fi passphrase, so the passphrase never passes through the conversation. The page uses the WLAN Pi's own certificate, so your browser may warn about it the first time.
+- **MCP Tasks** (`io.modelcontextprotocol/tasks`). `start_pcap_file`, `capture_scan`, `capture_observe`, `run_speedtest` and `profile_clients` run in the background with live progress. That keeps them clear of the client's per-request timeout. `profile_clients` requires task support.
+
+Task state and pending confirmations live in the daemon's memory. A restart drops them, and the client starts the call again.
+
 ## Development
 
 Requires Python ≥ 3.13.
