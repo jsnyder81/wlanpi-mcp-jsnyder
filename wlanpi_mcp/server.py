@@ -4,6 +4,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
 
+from wlanpi_mcp import elicit
 from wlanpi_mcp.__version__ import __version__
 from wlanpi_mcp.client.core_client import CoreClient
 from wlanpi_mcp.prompts import diagnostics
@@ -13,6 +14,7 @@ from wlanpi_mcp.resources import mode as mode_res
 from wlanpi_mcp.resources import netconfig as netconfig_res
 from wlanpi_mcp.resources import network as net_res
 from wlanpi_mcp.resources import profiler as profiler_res
+from wlanpi_mcp.tasks import Tasks
 from wlanpi_mcp.tools import (
     advanced,
     bluetooth,
@@ -29,6 +31,20 @@ from wlanpi_mcp.tools import (
     wlan,
 )
 
+#: Tools that run as an MCP Task (wlanpi_mcp/tasks.py) when the client
+#: declares the tasks extension: the ones that block for long enough to trip a
+#: client's per-request timer, or that run until a condition is met. Without
+#: the extension they run synchronously as before.
+TASK_TOOLS = frozenset(
+    {
+        "start_pcap_file",
+        "capture_scan",
+        "capture_observe",
+        "run_speedtest",
+        "profile_clients",
+    }
+)
+
 
 def create_server(client: CoreClient) -> MCPServer:
     """Create a WLAN Pi MCP server with all tools, resources, and prompts registered."""
@@ -40,6 +56,10 @@ def create_server(client: CoreClient) -> MCPServer:
             "profiler control, and diagnostics."
         ),
         version=__version__,
+        # Seals the multi-round-trip state elicitation confirms carry,
+        # bound to the caller's JWT (wlanpi_mcp/elicit.py).
+        request_state_security=elicit.request_state_security(),
+        extensions=[Tasks(TASK_TOOLS)],
     )
 
     # Phase 1 — system, network, utils
