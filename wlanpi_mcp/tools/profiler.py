@@ -9,7 +9,12 @@ from mcp.server.mcpserver import Context, MCPServer
 from mcp_types import InputRequiredResult
 
 from wlanpi_mcp import elicit, tasks
-from wlanpi_mcp.client.core_client import CoreClient
+from wlanpi_mcp.client.core_client import (
+    CoreAPIError,
+    CoreBadResponseError,
+    CoreClient,
+    CoreUnavailableError,
+)
 from wlanpi_mcp.tools import hints
 from wlanpi_mcp.tools.profiler_reports import build_reports, clients_since
 
@@ -24,6 +29,10 @@ MAX_PROFILE_MINUTES = 120
 #: How long a profiler that core reported as still 'starting' may take to
 #: show running before profile_clients treats it as having exited, in seconds.
 STARTUP_GRACE_S = 60
+
+#: How long profile_clients waits for an answer to "Keep going?", in seconds,
+#: before stopping as if the user said no.
+ANSWER_TIMEOUT_S = 300.0
 
 
 def register(mcp: MCPServer, client: CoreClient) -> None:
@@ -170,6 +179,7 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
 
     @mcp.tool(annotations=hints.DESTRUCTIVE)
     async def profile_clients(
+        ctx: Context,
         until_clients: int = 1,
         max_minutes: float = 10,
         output: Literal["json", "links", "zip"] = "json",
@@ -197,8 +207,12 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
         stops the profiler.
 
         Tell the user to connect their devices to the profiler's SSID while
-        it runs. Without task support this returns an error: use
-        start_profiler, poll get_profiler_reports, then stop_profiler.
+        it runs; the progress message names the SSID but not the passphrase
+        (get_profiler_status has it). At the time limit, a client that can
+        show elicitation forms is asked whether to keep going (no answer
+        within 5 minutes is a no); other clients just stop there. Without
+        task support this returns an error: use start_profiler, poll
+        get_profiler_reports, then stop_profiler.
 
         Args:
             until_clients: Stop once this many clients have been profiled (>= 1)
@@ -214,7 +228,8 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
             wpa3_personal: WPA3-Personal only
             wpa3_personal_transition: WPA3-Personal transition mode
             ask_to_extend: When max_minutes pass with fewer clients, ask the
-                user whether to keep going instead of stopping
+                user whether to keep going instead of stopping (only where
+                the client supports elicitation)
         """
         if not tasks.in_task():
             return {
@@ -242,52 +257,69 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
             "wpa3_personal": wpa3_personal,
             "wpa3_personal_transition": wpa3_personal_transition,
         }
+        # Ask "Keep going?" only where the client can show the question; a
+        # task parked on a question nobody sees would hold the radio.
+        can_ask = ask_to_extend and elicit.can_form(ctx)
         # This server runs on the device, so its clock is the one core stamps
-        # the profile files with.
+        # the profile files with. Taken before the start call: core can take
+        # ~25 s to bring the AP up, and clients profiled meanwhile count.
         started = time.time()
-        start = await client.post(
-            "/api/v1/profiler/start",
-            json={k: v for k, v in args.items() if v is not None},
-        )
-        if not start.get("success"):
-            # Includes 'already_running': that profiler is not ours to stop.
-            return {"error": "the profiler did not start", "start": start}
-
         profiled: list[str] = []
         deadline = started + max_minutes * 60
         stopped_because = "time_limit"
         seen_running = False
-        ap: dict[str, Any] = {}
+        ap_ssid: str | None = None
 
         def progress() -> str:
             minutes, seconds = divmod(int(time.time() - started), 60)
-            joined = (
-                f"; profiler SSID '{ap['ssid']}'"
-                + (f", passphrase '{ap['passphrase']}'" if ap.get("passphrase") else "")
-                if ap.get("ssid")
-                else ""
-            )
+            # The SSID only: status messages reach the model and the client's
+            # logs, so the passphrase stays in get_profiler_status.
+            joined = f"; profiler SSID '{ap_ssid}'" if ap_ssid else ""
             return (
                 f"{len(profiled)} of {until_clients} clients profiled, "
                 f"{minutes}m{seconds:02d}s elapsed{joined}"
             )
 
+        async def poll(path: str, fallback: Any) -> Any:
+            # One failed poll (a core restart, a timeout) does not end the
+            # run: keep the last answer and let the deadline decide.
+            try:
+                if path == "files":
+                    return await clients_since(client, started)
+                return await client.get(path)
+            except (CoreAPIError, CoreUnavailableError, CoreBadResponseError) as exc:
+                log.warning("profile_clients poll failed: %r", exc)
+                return fallback
+
+        # Claimed before the start call: a cancel landing while core is still
+        # starting the profiler must still stop whatever core goes on to run.
+        owned = True
         try:
             async with tasks.reporting(progress):
+                start = await client.post(
+                    "/api/v1/profiler/start",
+                    json={k: v for k, v in args.items() if v is not None},
+                )
+                if not start.get("success"):
+                    # Includes 'already_running': that profiler is not ours.
+                    owned = False
+                    return {"error": "the profiler did not start", "start": start}
                 while True:
-                    profiled = await clients_since(client, started)
+                    profiled = await poll("files", profiled)
                     if len(profiled) >= until_clients:
                         stopped_because = "target_reached"
                         break
-                    status = await client.get("/api/v1/profiler/status")
-                    if status.get("running"):
+                    status = await poll("/api/v1/profiler/status", None)
+                    if status is not None and status.get("running"):
                         seen_running = True
-                        ap = status
-                    elif seen_running or time.time() > started + STARTUP_GRACE_S:
+                        ap_ssid = status.get("ssid") or ap_ssid
+                    elif status is not None and (
+                        seen_running or time.time() > started + STARTUP_GRACE_S
+                    ):
                         stopped_because = "profiler_exited"
                         break
                     if time.time() >= deadline:
-                        if not ask_to_extend or not await _keep_going(
+                        if not can_ask or not await _keep_going(
                             len(profiled), until_clients, max_minutes
                         ):
                             break
@@ -296,10 +328,11 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
         finally:
             # Also on cancel: never leave the profiler running for a task
             # that no longer exists.
-            try:
-                await client.post("/api/v1/profiler/stop")
-            except Exception as exc:  # noqa: BLE001 - the run's outcome matters more
-                log.warning("stopping the profiler after profile_clients: %r", exc)
+            if owned:
+                try:
+                    await client.post("/api/v1/profiler/stop")
+                except Exception as exc:  # noqa: BLE001 - the outcome matters more
+                    log.warning("stopping the profiler after profile_clients: %r", exc)
 
         result = await build_reports(
             client, output=output, max_clients=0, since=started
@@ -314,12 +347,21 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
 
 
 async def _keep_going(profiled: int, target: int, minutes: float) -> bool:
-    """Ask the user mid-task whether to profile for another ``minutes``."""
-    reply = await tasks.request_input(
-        elicit.form_request(
-            f"Only {profiled} of {target} clients profiled so far. Keep the "
-            f"profiler running for another {minutes:g} minutes?"
-        ),
-        label="extend",
-    )
+    """Ask the user mid-task whether to profile for another ``minutes``.
+
+    No answer within ANSWER_TIMEOUT_S counts as no: the profiler holds a
+    radio while the question waits.
+    """
+    try:
+        reply = await tasks.request_input(
+            elicit.form_request(
+                f"Only {profiled} of {target} clients profiled so far. Keep the "
+                f"profiler running for another {minutes:g} minutes?"
+            ),
+            label="extend",
+            timeout_s=ANSWER_TIMEOUT_S,
+        )
+    except TimeoutError:
+        log.info("profile_clients: no answer to 'keep going', stopping")
+        return False
     return reply.get("action") == "accept"

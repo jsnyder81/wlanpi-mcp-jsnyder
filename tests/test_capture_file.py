@@ -143,7 +143,24 @@ async def _in_task(coro):
         tasks._current.set(record)
         return await coro
 
-    return record, asyncio.create_task(run())
+    record.job = asyncio.create_task(run())
+    return record, record.job
+
+
+def _tasks_cancel(record):
+    """Deliver a cancel the way tasks/cancel does."""
+    record.cancel_requested = True
+    record.job.cancel()
+
+
+async def _writing(session_id):
+    """Wait until the capture has written its first bytes."""
+    for _ in range(100):
+        entry = capture_file._CAPTURES.get(session_id)
+        if entry is not None and entry.bytes_written:
+            return entry
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"{session_id} never wrote")
 
 
 async def test_under_a_task_start_completes_when_the_capture_ends(capdir):
@@ -189,14 +206,9 @@ async def test_cancelling_the_task_stops_the_capture_and_keeps_the_file(capdir):
     _record, job = await _in_task(
         tools["start_pcap_file"].fn(channels=[6], duration_s=600)
     )
-    entry = None
-    for _ in range(100):
-        entry = capture_file._CAPTURES.get("cap_cancel")
-        if entry is not None and entry.bytes_written:
-            break
-        await asyncio.sleep(0.01)
-    assert entry is not None
+    entry = await _writing("cap_cancel")
 
+    # Not tasks/cancel (e.g. the daemon shutting down): the task is cancelled.
     job.cancel()
     with pytest.raises(asyncio.CancelledError):
         await job
@@ -204,6 +216,36 @@ async def test_cancelling_the_task_stops_the_capture_and_keeps_the_file(capdir):
     assert entry.status == "stopped"
     assert stub.commands[-1] == "stop" and stub.closed is True
     assert Path(entry.path).read_bytes()[:4] == b"\x0a\x0d\x0d\x0a"
+
+
+async def test_tasks_cancel_completes_with_the_kept_file(capdir):
+    # A cancelled Task carries no result, so tasks/cancel stops the capture
+    # early and the task completes with the file it kept.
+    _tmp, use = capdir
+    stub = use(
+        BlockingWS(
+            [
+                AUTH_OK,
+                sessions_event(),
+                CONFIG_APPLIED,
+                started_event("cap_early"),
+                *pcapng_chunks(BEACON_A),
+            ]
+        )
+    )
+    tools = _register()
+    record, job = await _in_task(
+        tools["start_pcap_file"].fn(channels=[6], duration_s=600)
+    )
+    await _writing("cap_early")
+
+    _tasks_cancel(record)
+    result = await asyncio.wait_for(job, timeout=5)
+    assert result["cancelled"] is True
+    assert result["status"] == "stopped"
+    assert result["size_bytes"] > 0
+    assert "fetch_pcap_file(capture_id='cap_early')" in result["message"]
+    assert stub.commands.count("stop") == 1 and stub.closed is True
 
 
 async def test_start_rejects_a_busy_interface(capdir):

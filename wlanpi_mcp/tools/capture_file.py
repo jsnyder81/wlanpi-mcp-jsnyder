@@ -230,7 +230,8 @@ async def _follow_as_task(entry: FileCapture) -> dict[str, Any]:
     The capture itself still runs in its own background job; this only
     waits on it, reporting progress, so the task completes with the final
     capture result. tasks/cancel stops the capture the way stop_pcap_file
-    does: the file is kept, and the job's finally still stops and closes.
+    does (the job's finally still stops and closes) and completes the task
+    with the file it kept, marked 'cancelled'.
     """
 
     def progress() -> str:
@@ -241,6 +242,7 @@ async def _follow_as_task(entry: FileCapture) -> dict[str, Any]:
         )
 
     assert entry.task is not None
+    early = False
     async with tasks.reporting(progress):
         try:
             # Shielded so a cancel stops the capture gracefully rather than
@@ -248,12 +250,16 @@ async def _follow_as_task(entry: FileCapture) -> dict[str, Any]:
             await asyncio.shield(entry.task)
         except asyncio.CancelledError:
             entry.stop_event.set()
+            early = tasks.stop_early()
             try:
                 await entry.task
             except Exception as exc:  # noqa: BLE001 - status carries the error
                 log.debug("awaiting stopped capture task: %r", exc)
-            raise
+            if not early:
+                raise
     result = entry.to_result()
+    if early:
+        result["cancelled"] = True
     result["message"] = (
         f"capture {entry.status}; fetch it with "
         f"fetch_pcap_file(capture_id='{entry.session_id}')"
@@ -314,7 +320,8 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
         Clients that support MCP Tasks get a task instead: it shows the
         capture_id and bytes so far while the capture runs, and completes with
         the final path, status and size when it ends. Cancelling the task
-        stops the capture and keeps the file; stop_pcap_file still works too.
+        stops the capture and completes it with the kept file, marked
+        'cancelled': true; stop_pcap_file still works too.
 
         This tool always owns the interface. If a capture is already running on
         it, this returns an error rather than taking it over — watch that one

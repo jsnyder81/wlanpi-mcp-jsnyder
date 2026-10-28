@@ -27,7 +27,10 @@ tasks (their captures stop with their sockets) and a poll afterwards gets
 
 Tools running as a task report progress with set_status() or reporting(),
 and can ask the user mid-task with request_input(); all three are no-ops or
-unavailable outside a task.
+unavailable outside a task. tasks/cancel is cooperative, as the spec allows:
+a tool that can end early with a useful result (a capture cut short) calls
+stop_early() when the cancel lands and completes normally with what it has,
+since a 'cancelled' Task carries no result. Everything else ends 'cancelled'.
 """
 
 import asyncio
@@ -113,6 +116,8 @@ class TaskRecord:
     result: dict[str, Any] | None = None
     error: dict[str, Any] | None = None
     job: asyncio.Task[None] | None = None
+    #: Set by tasks/cancel, so stop_early() can tell it from other cancels.
+    cancel_requested: bool = False
     #: Outstanding in-task input requests (request_input), keyed per lifetime.
     input_requests: dict[str, Any] = field(default_factory=dict)
     _waiters: dict[str, asyncio.Future[dict[str, Any]]] = field(default_factory=dict)
@@ -218,8 +223,28 @@ async def reporting(
         set_status(describe())
 
 
+def stop_early() -> bool:
+    """
+    Turn a tasks/cancel into an early, normal finish of the current task.
+
+    Call it from an ``except asyncio.CancelledError`` block: it returns True,
+    and withdraws the cancellation, only when the CancelledError came from
+    tasks/cancel on the task this code runs under. The tool then finishes
+    its work early and returns its partial result, which completes the task
+    (a cancelled Task cannot carry one). On False, re-raise.
+    """
+    record = _current.get()
+    job = asyncio.current_task()
+    if record is None or not record.cancel_requested or job is not record.job:
+        return False
+    if job is not None:
+        job.uncancel()
+    record.touch("Stopping early: cancelled by the client")
+    return True
+
+
 async def request_input(
-    request: dict[str, Any], label: str = "input"
+    request: dict[str, Any], label: str = "input", timeout_s: float | None = None
 ) -> dict[str, Any]:
     """
     Ask the client for input mid-task and wait for its tasks/update answer.
@@ -228,9 +253,11 @@ async def request_input(
     "params": {...}}). The task shows input_required until the client
     answers; the answer (e.g. an ElicitResult dict) is returned. Each call
     gets a fresh key, as the spec requires keys to be unique per task.
+    With ``timeout_s``, an unanswered question is withdrawn after that long.
 
     Raises:
         RuntimeError: outside a task.
+        TimeoutError: no answer within ``timeout_s``.
     """
     record = _current.get()
     if record is None:
@@ -243,7 +270,7 @@ async def request_input(
     record.status = "input_required"
     record.touch()
     try:
-        return await waiter
+        return await asyncio.wait_for(waiter, timeout_s)
     finally:
         record._waiters.pop(key, None)
         record.input_requests.pop(key, None)
@@ -392,7 +419,14 @@ class Tasks(Extension):
     ) -> dict[str, Any]:
         _require_capability(ctx)
         record = _lookup(params.task_id)
-        if record.job is not None and not record.job.done():
+        # A repeat is acknowledged but not delivered again: it would cut short
+        # the cleanup, or the early stop, that the first one started.
+        if (
+            record.job is not None
+            and not record.job.done()
+            and not record.cancel_requested
+        ):
+            record.cancel_requested = True
             # Cooperative: the job's own finally blocks (e.g. stopping a
             # capture) run before it reports 'cancelled'.
             record.job.cancel()

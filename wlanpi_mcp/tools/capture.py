@@ -8,6 +8,7 @@ capture lives with its socket: the owner flow always stops the capture and
 closes the socket before returning, so no ownerless capture is left running.
 """
 
+import asyncio
 import logging
 import time
 from typing import Any
@@ -59,6 +60,11 @@ SINGLE_RADIO_HINT = (
     "'Device or resource busy' while wlan0 scans, so the listed channels were "
     "not all visited — this result is partial. Take wlan0 down or use a second "
     "adapter for reliable multi-channel capture."
+)
+
+CANCELLED_NOTE = (
+    "The task was cancelled before the capture window ended, so this summary "
+    "covers only the frames captured until then."
 )
 
 
@@ -144,6 +150,7 @@ async def _run_window(
     table = ScanTable()
     reader = PcapngReader()
     started = time.monotonic()
+    cancelled = False
 
     def progress() -> str:
         elapsed = min(int(time.monotonic() - started), duration_s)
@@ -155,7 +162,21 @@ async def _run_window(
         )
 
     async with tasks.reporting(progress):
-        events = await sock.consume(reader, table, duration_s, frame_log, raw_sink)
+        try:
+            events = await sock.consume(reader, table, duration_s, frame_log, raw_sink)
+        except asyncio.CancelledError:
+            # tasks/cancel ends the window early; the frames so far are still
+            # a result (a subscriber just detaches, an owner stops and drains
+            # below as at the end of a full window).
+            if not tasks.stop_early():
+                raise
+            events = {
+                "channel_issues": list(sock.channel_issues),
+                "other_frames": table.other,
+                "capture_ended": False,
+                "stream_closed": False,
+            }
+            cancelled = True
         if owner and not events.get("capture_ended"):
             # The capture window is over. Ask core to stop, then keep dissecting
             # for a bounded margin: 'stop' flushes dumpcap's final frames and emits
@@ -174,6 +195,8 @@ async def _run_window(
             # not that we stopped it normally. Counts stay cumulative.
             events["capture_ended"] = window_ended
             events["stream_closed"] = window_closed
+    if cancelled:
+        events["cancelled"] = True
     return table, events
 
 
@@ -231,6 +254,9 @@ def _summary(
     }
     if result["channel_issues"]:
         result["note"] = SINGLE_RADIO_HINT
+    if events.get("cancelled"):
+        result["cancelled"] = True
+        result["cancelled_note"] = CANCELLED_NOTE
     return result
 
 
@@ -259,7 +285,8 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
         longer than the 60 s window, use the non-streaming file-capture tools
         (start_pcap_file/fetch_pcap_file) instead. Clients that support MCP
         Tasks get it as a background task with live progress; the result is
-        the same.
+        the same. Cancelling that task stops the capture early and completes
+        it with the summary so far, marked 'cancelled': true.
 
         The result has two parts:
         - 'aps': one row per BSSID from beacons/probe-responses, with SSID,
@@ -448,7 +475,9 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
         capture; the role in the result is always 'subscriber'. The result
         includes the owner's running config (channels, width, dwell, filter),
         so it is clear what the summary does and does not cover. Clients that
-        support MCP Tasks get it as a background task with live progress.
+        support MCP Tasks get it as a background task with live progress;
+        cancelling it detaches early and completes with the summary so far,
+        marked 'cancelled': true.
 
         Returns the same dissected summary as capture_scan (an 'aps' table with
         full security detail, plus per-frame 'frames'/'frame_types' with

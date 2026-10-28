@@ -28,6 +28,11 @@ class ClosedByServer(Exception):
         self.code = code
 
 
+#: Script marker: the socket goes quiet here (recv blocks until cancelled),
+#: like a capture still running mid-window.
+HANG = object()
+
+
 class StubWS:
     """Replays a queued script of server messages and records what was sent."""
 
@@ -43,6 +48,8 @@ class StubWS:
         if not self.script:
             raise ConnectionResetError("stub capture socket ran out of script")
         item = self.script.pop(0)
+        if item is HANG:
+            await asyncio.Event().wait()
         if isinstance(item, BaseException):
             raise item
         return item
