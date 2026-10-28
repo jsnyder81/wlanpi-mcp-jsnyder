@@ -1,8 +1,5 @@
 """MCP tools for WLAN Pi utilities: reachability, speedtest, UFW, and blinker."""
 
-import asyncio
-import contextlib
-import functools
 import logging
 import time
 from dataclasses import dataclass, field
@@ -34,7 +31,6 @@ class _SpeedtestRun:
     client: CoreClient
     started: float = field(default_factory=time.monotonic)
     record: tasks.TaskRecord | None = None
-    cancelling: bool = False
 
     async def request(self) -> dict[str, Any]:
         """Ask core for the speedtest result (the blocking path's body)."""
@@ -51,22 +47,6 @@ def _failed(exc: BaseException) -> dict[str, Any]:
     """Map a background speedtest failure to the dict the task reports."""
     log.exception("task-backed speedtest failed")
     return {"error": f"speedtest failed: {type(exc).__name__}: {exc}"}
-
-
-async def _cancel_speedtest(run: _SpeedtestRun) -> None:
-    """Abort the wait for core at the asyncio-task level, at most once.
-
-    wlanpi-core exposes no way to stop a running speedtest, so this ends our
-    side only: the HTTP request is dropped and the test runs to completion on
-    the device. A second cancel while the first is unwinding only waits.
-    """
-    work = run.record.work if run.record is not None else None
-    if work is not None:
-        if not run.cancelling:
-            run.cancelling = True
-            work.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await work
 
 
 def register(mcp: MCPServer, client: CoreClient) -> None:
@@ -153,10 +133,7 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
                 "/api/v1/utils/speedtest", timeout=SPEEDTEST_TIMEOUT_S
             )
         run = _SpeedtestRun(client=client)
-        run.record = tasks.TASKS.create(
-            progress=run.progress,
-            cancel=functools.partial(_cancel_speedtest, run),
-        )
+        run.record = tasks.TASKS.create(progress=run.progress, cancel_work=True)
         tasks.spawn(run.record, run.request(), on_error=_failed)
         return tasks.task_call_result(
             run.record,

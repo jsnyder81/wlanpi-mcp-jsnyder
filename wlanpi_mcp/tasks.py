@@ -17,7 +17,9 @@ store holds the record plus the hooks (progress, cancel) that reach it.
 `spawn` is the shared body for tools that hand their work to the background:
 it maps the work's end (return, Exception, CancelledError) onto the store's
 three outcomes and publishes it from a teardown path that a second cancel
-cannot interrupt.
+cannot interrupt. `_cancel_work` is the matching shared tasks/cancel hook
+(wired by `TaskStore.create(cancel_work=True)`): at-most-once cancel of the
+body task, then wait for its teardown.
 
 `tasks/result`, `tasks/list` and `notifications/tasks` are deliberately not
 implemented: the reference client (Claude Code's public beta) does not use
@@ -25,10 +27,13 @@ them, and the outcome rides in the `tasks/get` response instead.
 
 `input_required` with `inputRequests` is the in-task elicitation route. The
 store and the `tasks/update` handler carry the plumbing (park a task on a
-question, accept the answer, resume), but no tool uses it yet; see issue #92.
+question, accept the answer, resume), and profile_clients is its first user:
+it parks on a "Keep going?" confirm when its time window ends early.
 """
 
 import asyncio
+import contextlib
+import functools
 import logging
 import secrets
 import time
@@ -106,6 +111,8 @@ class TaskRecord:
     cancel: Callable[[], Awaitable[None]] | None = None
     #: The body task started by spawn(), so a poll (or a test) can await it.
     work: asyncio.Task[None] | None = None
+    #: Set by _cancel_work so a second cancel only waits (at-most-once).
+    work_cancelled: bool = False
     #: Set by tasks/cancel before the hook runs so the work's own completion
     #: path reports "cancelled" rather than "completed".
     cancel_requested: bool = False
@@ -135,8 +142,14 @@ class TaskStore:
         progress: Callable[[], str | None] | None = None,
         cancel: Callable[[], Awaitable[None]] | None = None,
         ttl_ms: int | None = TASK_TTL_MS,
+        cancel_work: bool = False,
     ) -> TaskRecord:
-        """Register a new working task and return its record."""
+        """Register a new working task and return its record.
+
+        cancel_work=True wires the record's cancel hook to the shared
+        _cancel_work (the spawn-backed tools' tasks/cancel path), so the
+        caller does not have to build the functools.partial itself.
+        """
         now = time.time()
         self.prune(now)
         record = TaskRecord(
@@ -147,6 +160,8 @@ class TaskStore:
             progress=progress,
             cancel=cancel,
         )
+        if cancel_work:
+            record.cancel = functools.partial(_cancel_work, record)
         self._tasks[record.task_id] = record
         return record
 
@@ -221,8 +236,8 @@ class TaskStore:
         """Park a working task on a question; tasks/update delivers the answer.
 
         Returns the future the work awaits; it resolves to the answer dict
-        (or None when the client sends no content). Plumbing for #92; no
-        tool uses it yet.
+        (or None when the client sends no content or cancels while parked).
+        profile_clients uses this for its "Keep going?" confirm.
         """
         if record.terminal:  # pragma: no cover - guard for misuse
             raise RuntimeError(f"task {record.task_id} is already {record.status}")
@@ -407,6 +422,27 @@ def spawn(
     )
     record.work = task
     return task
+
+
+async def _cancel_work(record: TaskRecord) -> None:
+    """Cancel a task's work at most once and wait for it to end.
+
+    The tasks/cancel hook shared by every spawn-backed tool (wired by
+    TaskStore.create(cancel_work=True)): the first call delivers
+    CancelledError to the body task, whose spawn teardown then releases
+    the underlying resource; a second cancel while the first is unwinding
+    only waits (re-cancelling interrupts nothing but buys no determinism).
+    The wait swallows the CancelledError the body raises on its way out:
+    the caller reads the outcome from the record.
+    """
+    work = record.work
+    if work is None:
+        return
+    if not record.work_cancelled:
+        record.work_cancelled = True
+        work.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await work
 
 
 def tasks_supported(ctx: Context[Any, Any] | None) -> bool:

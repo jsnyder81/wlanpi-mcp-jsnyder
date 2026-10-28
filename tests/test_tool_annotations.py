@@ -19,6 +19,7 @@ DESTRUCTIVE = {
     "renew_dhcp_lease",  # may change the address the client is using
     "start_profiler",  # takes an adapter over for its AP
     "stop_profiler",
+    "profile_clients",  # starts and stops the profiler as one task
     "purge_profiler_data",  # deletes saved profiles and reports
     "start_service",  # e.g. wlanpi-profiler takes a radio
     "stop_service",
@@ -57,6 +58,7 @@ CONFIRMED = {
     "reboot_device",
     "shutdown_device",
     "purge_profiler_data",
+    "profile_clients",  # takes a radio before the task even starts
     "delete_network_config",  # only when force=true
     "reset_network_namespaces",
     "set_regulatory_domain",
