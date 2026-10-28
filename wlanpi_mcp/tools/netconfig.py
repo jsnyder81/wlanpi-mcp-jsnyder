@@ -165,10 +165,19 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
                     f"then accept here to create profile '{config['id']}'."
                 ),
             )
-        return await client.post(
-            "/api/v1/network/config/",
-            json=netconfig_secrets.apply(dict(config), filled),
-        )
+        try:
+            return await client.post(
+                "/api/v1/network/config/",
+                json=netconfig_secrets.apply(dict(config), filled),
+            )
+        except CoreAPIError as exc:
+            # Core's 422 echoes the request body, passphrases included: keep
+            # them out of the error the model (and the log) sees.
+            raise ToolError(
+                netconfig_secrets.redact(str(exc), filled)
+                + " The passphrase was not saved; fix the profile and call "
+                "create_network_config again."
+            ) from None
 
     @mcp.tool(annotations=hints.DESTRUCTIVE)
     async def update_network_config(

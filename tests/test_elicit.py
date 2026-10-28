@@ -6,7 +6,9 @@ answer and the sealed requestState. Clients that cannot elicit must get the
 tool's behaviour from before (#86-#89).
 """
 
+import json
 import re
+from urllib.parse import urlencode
 
 import httpx
 import pytest
@@ -543,11 +545,60 @@ async def test_passphrase_goes_through_the_page_not_the_conversation(
         assert (await http.get(route)).status_code == 404
     assert netconfig_secrets._TICKETS == {}
     sent = create.calls[0].request
-    import json
-
     assert json.loads(sent.content)["namespaces"][0]["security"]["psk"] == PASSPHRASE
     for body in (first, early, done):
         assert PASSPHRASE not in json.dumps(body)
+
+
+async def test_core_errors_never_echo_the_entered_passphrase(
+    mcp, _device_info, lan_host
+):
+    # Core's 422 echoes the request body, psk included (seen on a real Pi).
+    tricky = 'quote"back\\slash pass'
+
+    def echo(request):
+        body = json.loads(request.content)
+        return httpx.Response(
+            422,
+            json={
+                "detail": [
+                    {
+                        "type": "missing",
+                        "loc": ["body", "roots", 0, "phy"],
+                        "input": body["namespaces"][0],
+                    }
+                ]
+            },
+        )
+
+    _device_info.post(CREATE).mock(side_effect=echo)
+    async with _serve(mcp) as http:
+        key, params, state = wire.question(
+            await wire.call(
+                http,
+                "create_network_config",
+                {"config": PROFILE},
+                capabilities=wire.URL,
+            )
+        )
+        await http.post(
+            await _open_page(http, params),
+            content=urlencode({"p0": tricky}),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        done = await wire.call(
+            http,
+            "create_network_config",
+            {"config": PROFILE},
+            capabilities=wire.URL,
+            answers={key: wire.accept()},
+            state=state,
+        )
+    result = done["result"]
+    assert result["isError"] is True
+    text = result["content"][0]["text"]
+    assert "422" in text and '"psk":"***"' in text
+    assert "quote" not in json.dumps(done)
 
 
 async def test_the_page_rejects_a_passphrase_core_would_refuse(mcp, lan_host):

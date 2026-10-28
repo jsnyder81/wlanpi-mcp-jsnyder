@@ -22,6 +22,7 @@ has none; the ticket is the credential.
 
 import hashlib
 import html
+import json
 import re
 import secrets
 import time
@@ -177,6 +178,14 @@ def apply(
     for slot, value in filled:
         out[slot.section][slot.index]["security"]["psk"] = value
     return out
+
+
+def redact(text: str, filled: list[tuple[SecretSlot, str]]) -> str:
+    """Remove the entered passphrases from ``text``, raw or JSON-escaped."""
+    for _slot, value in filled:
+        for form in {value, json.dumps(value)[1:-1]}:
+            text = text.replace(form, "***")
+    return text
 
 
 def _check(security: str, value: str) -> str | None:
