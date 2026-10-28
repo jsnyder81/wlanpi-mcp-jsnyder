@@ -210,7 +210,7 @@ async def test_start_as_task_returns_a_task_and_completes(capdir):
 
 async def test_task_progress_reports_bytes_written(capdir):
     _tmp, use = capdir
-    use(
+    stub = use(
         BlockingWS(
             [
                 AUTH_OK,
@@ -227,10 +227,9 @@ async def test_task_progress_reports_bytes_written(capdir):
     )
     record = tasks.TASKS.get(result.task_id)
     entry = capture_file._CAPTURES["cap_tkp"]
-    # Let the background task run until it has drained the delivered chunks
-    # and parked waiting for more: cooperative yields, no wall-clock wait.
-    while not entry.bytes_written:
-        await asyncio.sleep(0)
+    # The background run has drained the delivered chunks and parked waiting
+    # for more: fail fast rather than spin, if it ever does not.
+    await asyncio.wait_for(stub.parked.wait(), timeout=5)
 
     # While working, tasks/get reports the bytes written so far.
     assert f"{entry.bytes_written} bytes written" in tasks.wire(record)["statusMessage"]

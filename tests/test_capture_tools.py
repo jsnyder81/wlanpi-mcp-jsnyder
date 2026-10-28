@@ -4,15 +4,18 @@ import asyncio
 import json
 import ssl
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Context, MCPServer
+from mcp.types import ClientCapabilities
 
 from tests.test_capture_dot11 import beacon, radiotap
 from tests.test_capture_pcapng import epb, idb, shb
+from wlanpi_mcp import tasks
 from wlanpi_mcp.capture import storage
-from wlanpi_mcp.capture.ws_client import CaptureSocket
+from wlanpi_mcp.capture.ws_client import CaptureError, CaptureSocket
 from wlanpi_mcp.client.core_client import CoreClient
 from wlanpi_mcp.config import Settings
 from wlanpi_mcp.tools import capture as capture_tools
@@ -64,8 +67,14 @@ class StubWS:
 class BlockingWS(StubWS):
     """Like StubWS but, once its script is exhausted, blocks instead of raising.
 
-    The capture stays 'running' until an early stop trips the poll.
+    The capture stays 'running' until an early stop or cancel trips it; parked
+    is set when the background run reaches that park, so tests can await it
+    instead of spinning.
     """
+
+    def __init__(self, script=None) -> None:
+        super().__init__(script)
+        self.parked = asyncio.Event()
 
     async def recv(self):
         if self.script:
@@ -73,7 +82,44 @@ class BlockingWS(StubWS):
             if isinstance(item, BaseException):
                 raise item
             return item
+        self.parked.set()
         await asyncio.sleep(3600)
+
+
+class SlowStopWS(BlockingWS):
+    """BlockingWS whose 'stop' send parks until the test releases it.
+
+    Holds a cancelled run inside its teardown, so a second tasks/cancel lands
+    while the first is unwinding. stops counts the stop commands sent.
+    """
+
+    def __init__(self, script=None) -> None:
+        super().__init__(script)
+        self.stop_started = asyncio.Event()
+        self.stop_gate = asyncio.Event()
+        self.stops = 0
+
+    async def send(self, raw):
+        message = json.loads(raw)
+        if message.get("command") == "stop":
+            self.stops += 1
+            self.stop_started.set()
+            await self.stop_gate.wait()
+        self.sent.append(message)
+
+
+class SlowCloseWS(StubWS):
+    """StubWS whose close parks until released, to hold a run in teardown."""
+
+    def __init__(self, script=None) -> None:
+        super().__init__(script)
+        self.closing = asyncio.Event()
+        self.close_gate = asyncio.Event()
+
+    async def close(self):
+        self.closing.set()
+        await self.close_gate.wait()
+        self.closed = True
 
 
 def event(code, data=None, event_type="status"):
@@ -145,13 +191,10 @@ BEACON_A = beacon(bssid="00:11:22:33:44:55", ssid=b"lab-24", rt=radiotap(2437, -
 BEACON_B = beacon(bssid="66:77:88:99:aa:bb", ssid=b"lab-5", rt=radiotap(5180, -60))
 
 
-@pytest.fixture
-def ws(monkeypatch, tmp_path):
-    """Monkeypatches connect_capture to hand back a CaptureSocket on a stub."""
-    stub = StubWS()
+def _install(monkeypatch, tmp_path, stub):
+    """Route capture_tools' connect through stub, with files in tmp_path."""
 
     async def fake_connect(settings):
-        stub.settings = settings
         return CaptureSocket(stub, url="ws://test/api/v1/streaming/capture")
 
     monkeypatch.setattr(capture_tools, "connect_capture", fake_connect)
@@ -159,8 +202,13 @@ def ws(monkeypatch, tmp_path):
     # tmp_path so tests don't write into the real default location.
     settings = Settings(PCAP_CAPTURE_DIR=str(tmp_path), _env_file=None)
     monkeypatch.setattr(storage, "get_settings", lambda: settings)
-    stub.capture_dir = tmp_path
     return stub
+
+
+@pytest.fixture
+def ws(monkeypatch, tmp_path):
+    """Monkeypatches connect_capture to hand back a CaptureSocket on a stub."""
+    return _install(monkeypatch, tmp_path, StubWS())
 
 
 def _register(client=None):
@@ -171,6 +219,47 @@ def _register(client=None):
     mcp = MCPServer("test")
     capture_tools.register(mcp, mock_client)
     return mcp._tool_manager._tools, mock_client
+
+
+@pytest.fixture
+def blocking_ws(monkeypatch, tmp_path):
+    """Like ws, but the stub parks (stays running) when its script runs dry."""
+    return _install(monkeypatch, tmp_path, BlockingWS())
+
+
+@pytest.fixture(autouse=True)
+async def _clean_tasks(monkeypatch):
+    """Clear the store, and collect spawned task bodies for teardown."""
+    tasks.TASKS.clear()
+    spawned: list[asyncio.Task[None]] = []
+    real_spawn = tasks.spawn
+
+    def spy(record, work, **kwargs):
+        task = real_spawn(record, work, **kwargs)
+        spawned.append(task)
+        return task
+
+    monkeypatch.setattr(tasks, "spawn", spy)
+    yield
+    for task in spawned:
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except BaseException:  # noqa: BLE001 - teardown swallows everything
+                pass
+    tasks.TASKS.clear()
+
+
+TASK_CAPS = ClientCapabilities(extensions={tasks.TASKS_EXTENSION_ID: {}})
+
+
+def _task_ctx(capable: bool) -> Context[Any, Any]:
+    """Fake a Context whose client either declares the tasks extension or not."""
+    ctx = MagicMock(spec=Context)
+    ctx.client_capabilities = TASK_CAPS if capable else ClientCapabilities()
+    ctx.protocol_version = "2026-07-28"
+    return ctx
 
 
 # ── auth ─────────────────────────────────────────────────────────────────────
@@ -466,7 +555,9 @@ async def test_config_invalid_is_returned_as_an_error(ws):
 async def test_owner_stops_the_capture_even_when_consuming_raises(ws, monkeypatch):
     ws.script = [AUTH_OK, sessions_event(), CONFIG_APPLIED, started_event()]
 
-    async def boom(sock, duration_s, frame_log, *, owner=False, raw_sink=None):
+    async def boom(
+        sock, duration_s, frame_log, *, owner=False, raw_sink=None, table=None
+    ):
         raise RuntimeError("dissector exploded")
 
     monkeypatch.setattr(capture_tools, "_run_window", boom)
@@ -851,3 +942,328 @@ def test_connect_capture_ssl_matches_url_scheme(monkeypatch):
             assert isinstance(captured["ssl"], ssl.SSLContext)
         else:
             assert captured["ssl"] is None
+
+
+# ── capture_scan / capture_observe as MCP Tasks (#91) ────────────────────────
+
+
+def _owner_script(session_id):
+    return [
+        AUTH_OK,
+        sessions_event(),
+        CONFIG_APPLIED,
+        started_event(session_id),
+        *pcapng_chunks(BEACON_A),
+        CHANNEL_SET,
+        CAPTURE_ENDED,
+    ]
+
+
+async def test_capture_scan_as_task_returns_a_task_and_completes(ws):
+    ws.script = _owner_script("cap_tk")
+    tools, _ = _register()
+    result = await tools["capture_scan"].run(
+        {"channels": [6], "duration_s": 1}, _task_ctx(capable=True)
+    )
+
+    assert isinstance(result, tasks.TaskCallResult)
+    assert result.result_type == "task"
+    assert result.status == "working"
+    assert result.structured_content["session_id"] == "cap_tk"
+    record = tasks.TASKS.get(result.task_id)
+    assert record is not None
+
+    await asyncio.wait_for(record.work, timeout=5)
+    assert record.status == "completed"
+    assert record.result["role"] == "owner"
+    assert record.result["ap_count"] == 1
+    # The capture ended on its own (CAPTURE_ENDED), and the run closed the
+    # socket: no ownerless capture is left behind.
+    assert ws.closed is True
+
+
+async def test_capture_scan_task_result_matches_the_blocking_result(ws):
+    ws.script = _owner_script("cap_eq")
+    tools, _ = _register()
+    result = await tools["capture_scan"].run(
+        {"channels": [6], "duration_s": 1}, _task_ctx(capable=True)
+    )
+    record = tasks.TASKS.get(result.task_id)
+    await asyncio.wait_for(record.work, timeout=5)
+    task_result = record.result
+
+    ws.script = _owner_script("cap_eq")
+    blocking = await tools["capture_scan"].fn(channels=[6], duration_s=1)
+
+    # The tee file path and size are incidental here; everything else is the
+    # same dict the blocking call returns.
+    for res in (task_result, blocking):
+        res.pop("pcap_path")
+        res.pop("pcap_bytes")
+    assert task_result == blocking
+
+
+async def test_capture_scan_task_progress_reports_channels_frames_issues(blocking_ws):
+    stub = blocking_ws
+    stub.script = [
+        AUTH_OK,
+        sessions_event(),
+        CONFIG_APPLIED,
+        started_event("cap_tkp"),
+        *pcapng_chunks(BEACON_A),
+        CHANNEL_SET,
+        CHANNEL_SET_FAILED,
+    ]
+    tools, _ = _register()
+    result = await tools["capture_scan"].run(
+        {"channels": [6, 36], "duration_s": 30}, _task_ctx(capable=True)
+    )
+    record = tasks.TASKS.get(result.task_id)
+    # The background run drains the delivered script and parks waiting for
+    # more; parked is set exactly when every scripted counter has advanced.
+    await asyncio.wait_for(stub.parked.wait(), timeout=5)
+
+    assert tasks.wire(record)["statusMessage"] == (
+        "visited 1 channels, counted 1 frames, 1 channel issue(s)"
+    )
+
+    await tasks.TASKS.cancel(record)
+    assert record.status == "cancelled"
+
+
+async def test_capture_scan_task_cancel_stops_the_capture(blocking_ws):
+    stub = blocking_ws
+    stub.script = [
+        AUTH_OK,
+        sessions_event(),
+        CONFIG_APPLIED,
+        started_event("cap_tkc"),
+        *pcapng_chunks(BEACON_A),
+    ]
+    tools, _ = _register()
+    result = await tools["capture_scan"].run(
+        {"channels": [6], "duration_s": 30}, _task_ctx(capable=True)
+    )
+    record = tasks.TASKS.get(result.task_id)
+    await asyncio.wait_for(stub.parked.wait(), timeout=5)
+
+    await tasks.TASKS.cancel(record)
+    assert record.status == "cancelled"
+    # The ownership rule holds: the cancelled run's teardown stopped the core
+    # session and closed the socket.
+    assert "stop" in stub.commands
+    assert stub.closed is True
+    # The cancelled outcome is marked partial and carries what was dissected,
+    # tee file included, so it cannot be mistaken for a finished window.
+    assert record.result["role"] == "owner"
+    assert record.result["frame_total"] == 1
+    assert record.result["capture_ended_early"] is True
+    assert Path(record.result["pcap_path"]).read_bytes()[:4] == b"\x0a\x0d\x0d\x0a"
+
+
+async def test_capture_scan_task_cancel_without_tee_publishes_no_pcap_path(
+    blocking_ws, monkeypatch, tmp_path
+):
+    stub = blocking_ws
+    stub.script = [
+        AUTH_OK,
+        sessions_event(),
+        CONFIG_APPLIED,
+        started_event("cap_tkt"),
+        *pcapng_chunks(BEACON_A),
+    ]
+    # A decoy file whose name ends with this capture id: a glob-based lookup
+    # would hand out that other run's capture when this run's own tee failed
+    # to open.
+    (tmp_path / "capture-20260101T000000-cap_tkt.pcapng").write_bytes(b"decoy")
+    monkeypatch.setattr(storage, "try_open_capture_file", lambda _cid: (None, None))
+    tools, _ = _register()
+    result = await tools["capture_scan"].run(
+        {"channels": [6], "duration_s": 30}, _task_ctx(capable=True)
+    )
+    record = tasks.TASKS.get(result.task_id)
+    await asyncio.wait_for(stub.parked.wait(), timeout=5)
+
+    await tasks.TASKS.cancel(record)
+    assert record.status == "cancelled"
+    assert "pcap_path" not in record.result
+
+
+async def test_capture_scan_task_double_cancel_stops_once(monkeypatch, tmp_path):
+    stub = _install(
+        monkeypatch,
+        tmp_path,
+        SlowStopWS(
+            [
+                AUTH_OK,
+                sessions_event(),
+                CONFIG_APPLIED,
+                started_event("cap_tkd"),
+                *pcapng_chunks(BEACON_A),
+            ]
+        ),
+    )
+    tools, _ = _register()
+    result = await tools["capture_scan"].run(
+        {"channels": [6], "duration_s": 30}, _task_ctx(capable=True)
+    )
+    record = tasks.TASKS.get(result.task_id)
+
+    first = asyncio.create_task(tasks.TASKS.cancel(record))
+    # Park the first cancel inside the run's teardown, then cancel again.
+    await asyncio.wait_for(stub.stop_started.wait(), timeout=5)
+    second = asyncio.create_task(tasks.TASKS.cancel(record))
+    stub.stop_gate.set()
+    await asyncio.wait_for(
+        asyncio.gather(first, second, return_exceptions=True), timeout=5
+    )
+
+    assert record.status == "cancelled"
+    assert stub.stops == 1  # at-most-once: the second cancel only waited
+    # The shielded teardown finished even across the second cancel: the
+    # ownership rule holds and the outcome was published.
+    assert stub.closed is True
+    assert record.result["role"] == "owner"
+    assert record.result["frame_total"] == 1
+
+
+async def test_capture_scan_task_cancel_after_window_completes_keeps_completed(
+    monkeypatch, tmp_path
+):
+    stub = _install(
+        monkeypatch,
+        tmp_path,
+        SlowCloseWS(
+            [
+                AUTH_OK,
+                sessions_event(),
+                CONFIG_APPLIED,
+                started_event("cap_tkw"),
+                *pcapng_chunks(BEACON_A),
+                CAPTURE_ENDED,
+            ]
+        ),
+    )
+    tools, _ = _register()
+    result = await tools["capture_scan"].run(
+        {"channels": [6], "duration_s": 1}, _task_ctx(capable=True)
+    )
+    record = tasks.TASKS.get(result.task_id)
+    # The window has fully run; the run parks in its teardown's close.
+    await asyncio.wait_for(stub.closing.wait(), timeout=5)
+
+    cancel = asyncio.create_task(tasks.TASKS.cancel(record))
+    stub.close_gate.set()
+    await asyncio.wait_for(cancel, timeout=5)
+
+    # The work was not cut short: its completed outcome stands.
+    assert record.status == "completed"
+    assert record.result["ap_count"] == 1
+    assert stub.closed is True
+
+
+async def test_capture_scan_without_task_support_is_unchanged(ws):
+    ws.script = _owner_script("cap_nt")
+    tools, _ = _register()
+    result = await tools["capture_scan"].run(
+        {"channels": [6], "duration_s": 1}, _task_ctx(capable=False)
+    )
+
+    assert isinstance(result, dict)
+    assert result["role"] == "owner"
+    assert result["session_id"] == "cap_nt"
+    # The gate pins it: no task is created for a client that cannot parse it.
+    assert len(tasks.TASKS) == 0
+
+
+async def test_capture_scan_task_failure_publishes_a_failed_task(ws, monkeypatch):
+    ws.script = [AUTH_OK, sessions_event(), CONFIG_APPLIED, started_event("cap_tkf")]
+
+    async def boom(
+        sock, duration_s, frame_log, *, owner=False, raw_sink=None, table=None
+    ):
+        raise RuntimeError("dissector exploded")
+
+    monkeypatch.setattr(capture_tools, "_run_window", boom)
+    tools, _ = _register()
+    result = await tools["capture_scan"].run(
+        {"channels": [6], "duration_s": 1}, _task_ctx(capable=True)
+    )
+    record = tasks.TASKS.get(result.task_id)
+    await asyncio.wait_for(record.work, timeout=5)
+
+    assert record.status == "failed"
+    assert "dissector exploded" in record.result["error"]
+    # Even the failed background run stops and closes: no ownerless capture.
+    assert "stop" in ws.commands
+    assert ws.closed is True
+
+
+async def test_capture_scan_task_capture_error_maps_like_the_blocking_path(
+    ws, monkeypatch
+):
+    ws.script = [AUTH_OK, sessions_event(), CONFIG_APPLIED, started_event("cap_tke")]
+
+    async def boom(
+        sock, duration_s, frame_log, *, owner=False, raw_sink=None, table=None
+    ):
+        raise CaptureError("CAPTURE_DIED: stream died", code="CAPTURE_DIED")
+
+    monkeypatch.setattr(capture_tools, "_run_window", boom)
+    tools, _ = _register()
+    result = await tools["capture_scan"].run(
+        {"channels": [6], "duration_s": 1}, _task_ctx(capable=True)
+    )
+    record = tasks.TASKS.get(result.task_id)
+    await asyncio.wait_for(record.work, timeout=5)
+
+    # The same dict the blocking path returns for a CaptureError, no prefix.
+    assert record.status == "failed"
+    assert record.result == {"error": "CAPTURE_DIED: stream died"}
+
+
+async def test_capture_observe_as_task_completes(ws):
+    ws.script = [
+        AUTH_OK,
+        subscribed_event("cap_ab12"),
+        *pcapng_chunks(BEACON_A),
+        CAPTURE_ENDED,
+    ]
+    tools, _ = _register()
+    result = await tools["capture_observe"].run(
+        {"session_id": "cap_ab12", "duration_s": 1}, _task_ctx(capable=True)
+    )
+
+    assert isinstance(result, tasks.TaskCallResult)
+    assert result.structured_content["role"] == "subscriber"
+    record = tasks.TASKS.get(result.task_id)
+    await asyncio.wait_for(record.work, timeout=5)
+    assert record.status == "completed"
+    assert record.result["role"] == "subscriber"
+    assert record.result["ap_count"] == 1
+    # A subscriber never stops the owner's capture.
+    assert "stop" not in ws.commands
+    assert ws.closed is True
+
+
+async def test_capture_observe_task_cancel_detaches_without_stopping(blocking_ws):
+    stub = blocking_ws
+    stub.script = [
+        AUTH_OK,
+        subscribed_event("cap_ab12"),
+        *pcapng_chunks(BEACON_A),
+    ]
+    tools, _ = _register()
+    result = await tools["capture_observe"].run(
+        {"session_id": "cap_ab12", "duration_s": 30}, _task_ctx(capable=True)
+    )
+    record = tasks.TASKS.get(result.task_id)
+    await asyncio.wait_for(stub.parked.wait(), timeout=5)
+
+    await tasks.TASKS.cancel(record)
+    assert record.status == "cancelled"
+    # Detaching must not disturb the owner's running capture.
+    assert "stop" not in stub.commands
+    assert stub.closed is True
+    assert record.result["role"] == "subscriber"
+    assert record.result["capture_ended_early"] is True

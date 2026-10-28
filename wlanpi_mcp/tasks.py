@@ -11,9 +11,13 @@ verbatim as the claimed `resultType: "task"` shape.
 
 The daemon is stateless, so the store is keyed on taskId alone, never on a
 session: polls arrive as unrelated POSTs with no connection to the call that
-created the task. A task outlives its request because the work itself runs
-in an `asyncio.create_task` (the pattern `_CAPTURES` already proves), and the
+created the task. A task outlives its request because the work itself runs in
+an `asyncio.create_task` (the pattern `_CAPTURES` already proves), and the
 store holds the record plus the hooks (progress, cancel) that reach it.
+`spawn` is the shared body for tools that hand their work to the background:
+it maps the work's end (return, Exception, CancelledError) onto the store's
+three outcomes and publishes it from a teardown path that a second cancel
+cannot interrupt.
 
 `tasks/result`, `tasks/list` and `notifications/tasks` are deliberately not
 implemented: the reference client (Claude Code's public beta) does not use
@@ -25,6 +29,7 @@ question, accept the answer, resume), but no tool uses it yet; see issue #92.
 """
 
 import asyncio
+import logging
 import secrets
 import time
 from collections.abc import Awaitable, Callable
@@ -46,6 +51,8 @@ from mcp.types import (
 )
 from mcp_types import INVALID_PARAMS
 from mcp_types.version import is_version_at_least
+
+log = logging.getLogger(__name__)
 
 #: Wire identifier of the Tasks extension, as advertised in client and
 #: server capabilities under `extensions`.
@@ -92,9 +99,13 @@ class TaskRecord:
     result: dict[str, Any] | None = None
     #: Called by tasks/get while working to render live progress text.
     progress: Callable[[], str | None] | None = None
-    #: Called by tasks/cancel to stop the underlying work; must leave the
-    #: work torn down (the ownership rule) before it returns.
+    #: Called by tasks/cancel to stop the underlying work. With spawn's
+    #: shielded teardown the record's outcome may already be published while
+    #: the teardown finishes in the background; the ownership rule still
+    #: holds, the work is always torn down.
     cancel: Callable[[], Awaitable[None]] | None = None
+    #: The body task started by spawn(), so a poll (or a test) can await it.
+    work: asyncio.Task[None] | None = None
     #: Set by tasks/cancel before the hook runs so the work's own completion
     #: path reports "cancelled" rather than "completed".
     cancel_requested: bool = False
@@ -177,7 +188,7 @@ class TaskStore:
         """Finish a task as failed; the outcome still rides in tasks/get."""
         self._finish(record, "failed", result)
 
-    def cancelled(self, record: TaskRecord, result: dict[str, Any]) -> None:
+    def cancelled(self, record: TaskRecord, result: dict[str, Any] | None) -> None:
         """Mark a task cancelled from its own work path (see store.cancel)."""
         self._finish(record, "cancelled", result)
 
@@ -325,6 +336,77 @@ def task_call_result(
         ttl_ms=record.ttl_ms,
         poll_interval_ms=POLL_INTERVAL_MS,
     )
+
+
+async def _run_as_task(
+    record: TaskRecord,
+    work: Awaitable[dict[str, Any]],
+    teardown: Callable[[], Awaitable[None]] | None,
+    on_cancel: Callable[[], dict[str, Any]] | None,
+    on_error: Callable[[BaseException], dict[str, Any]] | None,
+) -> None:
+    """Body task for spawn: map the work's end onto a published outcome."""
+    outcome: TaskStatus = "completed"
+    result: dict[str, Any] | None = None
+    try:
+        result = await work
+    except asyncio.CancelledError:
+        outcome = "cancelled"
+        result = on_cancel() if on_cancel is not None else None
+    except Exception as exc:  # noqa: BLE001 - the outcome rides in the task
+        outcome = "failed"
+        result = on_error(exc) if on_error is not None else {"error": str(exc)}
+    try:
+        if teardown is not None:
+            # Shielded: a cancel landing here (or a second one) interrupts
+            # only our wait, never the teardown. The underlying work (socket
+            # stop and close) still runs to completion, detached.
+            try:
+                await asyncio.shield(teardown())
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:  # noqa: BLE001 - best-effort teardown
+                # A wedged socket must not turn tasks/cancel into a protocol
+                # error: the outcome in the record is what matters.
+                log.debug("task %s teardown failed: %r", record.task_id, exc)
+    finally:
+        if outcome == "completed":
+            TASKS.complete(record, result or {})
+        elif outcome == "failed":
+            TASKS.fail(record, result or {})
+        else:
+            TASKS.cancelled(record, result)
+        # The record is terminal: drop the closures over the tool's run so
+        # its capture state is not pinned for the rest of the TTL.
+        record.progress = None
+        record.cancel = None
+    if outcome == "cancelled":
+        raise asyncio.CancelledError
+
+
+def spawn(
+    record: TaskRecord,
+    work: Awaitable[dict[str, Any]],
+    *,
+    teardown: Callable[[], Awaitable[None]] | None = None,
+    on_cancel: Callable[[], dict[str, Any]] | None = None,
+    on_error: Callable[[BaseException], dict[str, Any]] | None = None,
+) -> asyncio.Task[None]:
+    """Run work in the background as record's task body; return its handle.
+
+    The work's return value completes the task, an Exception fails it
+    (mapped through on_error) and a CancelledError cancels it (mapped
+    through on_cancel, or no result at all). Teardown then publish run
+    shielded, so a cancel cannot strand the underlying resources or leave
+    the record without an outcome; a cancel landing after the work already
+    returned still publishes that work's outcome, because the work was not
+    cut short. A failing teardown is logged, never raised.
+    """
+    task = asyncio.create_task(
+        _run_as_task(record, work, teardown, on_cancel, on_error)
+    )
+    record.work = task
+    return task
 
 
 def tasks_supported(ctx: Context[Any, Any] | None) -> bool:
