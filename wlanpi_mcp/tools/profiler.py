@@ -1,13 +1,29 @@
 """MCP tools for controlling the wlanpi-profiler."""
 
-from typing import Any
+import asyncio
+import logging
+import time
+from typing import Any, Literal
 
 from mcp.server.mcpserver import Context, MCPServer
 from mcp_types import InputRequiredResult
 
-from wlanpi_mcp import elicit
+from wlanpi_mcp import elicit, tasks
 from wlanpi_mcp.client.core_client import CoreClient
 from wlanpi_mcp.tools import hints
+from wlanpi_mcp.tools.profiler_reports import build_reports, clients_since
+
+log = logging.getLogger(__name__)
+
+#: How often profile_clients checks the profiler's results, in seconds.
+PROFILE_POLL_S = 5.0
+
+#: The longest profile_clients run, in minutes, before it must be extended.
+MAX_PROFILE_MINUTES = 120
+
+#: How long a profiler that core reported as still 'starting' may take to
+#: show running before profile_clients treats it as having exited, in seconds.
+STARTUP_GRACE_S = 60
 
 
 def register(mcp: MCPServer, client: CoreClient) -> None:
@@ -151,3 +167,159 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
         if stop is not None:
             return stop
         return await client.post("/api/v1/profiler/purge")
+
+    @mcp.tool(annotations=hints.DESTRUCTIVE)
+    async def profile_clients(
+        until_clients: int = 1,
+        max_minutes: float = 10,
+        output: Literal["json", "links", "zip"] = "json",
+        interface: str | None = None,
+        channel: int | None = None,
+        frequency: int | None = None,
+        ssid: str | None = None,
+        no11r: bool | None = None,
+        no11ax: bool | None = None,
+        no11be: bool | None = None,
+        wpa3_personal: bool | None = None,
+        wpa3_personal_transition: bool | None = None,
+        ask_to_extend: bool = True,
+    ) -> dict[str, Any]:
+        """
+        Profile Wi-Fi clients until enough have been seen, then return their profiles.
+
+        Runs as an MCP Task (the client must support MCP Tasks): starts the
+        profiler, reports how many clients have been profiled so far, and
+        finishes when until_clients clients have been profiled or max_minutes
+        pass. It then stops the profiler and returns the get_profiler_reports
+        result for the clients profiled during this run only, plus a 'run'
+        summary (clients profiled, target, elapsed_s, stopped_because:
+        target_reached | time_limit | profiler_exited). Cancelling the task
+        stops the profiler.
+
+        Tell the user to connect their devices to the profiler's SSID while
+        it runs. Without task support this returns an error: use
+        start_profiler, poll get_profiler_reports, then stop_profiler.
+
+        Args:
+            until_clients: Stop once this many clients have been profiled (>= 1)
+            max_minutes: Stop after this long even with fewer clients (max 120)
+            output: How to return the profiles, as in get_profiler_reports
+            interface: WLAN interface for the profiler's AP (e.g. 'wlan0')
+            channel: 802.11 channel for the AP
+            frequency: Frequency in MHz (alternative to channel)
+            ssid: SSID for the profiler's AP
+            no11r: Disable 802.11r
+            no11ax: Disable 802.11ax
+            no11be: Disable 802.11be
+            wpa3_personal: WPA3-Personal only
+            wpa3_personal_transition: WPA3-Personal transition mode
+            ask_to_extend: When max_minutes pass with fewer clients, ask the
+                user whether to keep going instead of stopping
+        """
+        if not tasks.in_task():
+            return {
+                "error": (
+                    "profile_clients runs as an MCP Task and this client did "
+                    "not declare task support. Use start_profiler, poll "
+                    "get_profiler_reports, then stop_profiler instead."
+                )
+            }
+        if until_clients < 1:
+            return {"error": "until_clients must be 1 or more"}
+        if not 0 < max_minutes <= MAX_PROFILE_MINUTES:
+            return {
+                "error": f"max_minutes must be over 0 and at most {MAX_PROFILE_MINUTES}"
+            }
+
+        args = {
+            "interface": interface,
+            "channel": channel,
+            "frequency": frequency,
+            "ssid": ssid,
+            "no11r": no11r,
+            "no11ax": no11ax,
+            "no11be": no11be,
+            "wpa3_personal": wpa3_personal,
+            "wpa3_personal_transition": wpa3_personal_transition,
+        }
+        # This server runs on the device, so its clock is the one core stamps
+        # the profile files with.
+        started = time.time()
+        start = await client.post(
+            "/api/v1/profiler/start",
+            json={k: v for k, v in args.items() if v is not None},
+        )
+        if not start.get("success"):
+            # Includes 'already_running': that profiler is not ours to stop.
+            return {"error": "the profiler did not start", "start": start}
+
+        profiled: list[str] = []
+        deadline = started + max_minutes * 60
+        stopped_because = "time_limit"
+        seen_running = False
+        ap: dict[str, Any] = {}
+
+        def progress() -> str:
+            minutes, seconds = divmod(int(time.time() - started), 60)
+            joined = (
+                f"; profiler SSID '{ap['ssid']}'"
+                + (f", passphrase '{ap['passphrase']}'" if ap.get("passphrase") else "")
+                if ap.get("ssid")
+                else ""
+            )
+            return (
+                f"{len(profiled)} of {until_clients} clients profiled, "
+                f"{minutes}m{seconds:02d}s elapsed{joined}"
+            )
+
+        try:
+            async with tasks.reporting(progress):
+                while True:
+                    profiled = await clients_since(client, started)
+                    if len(profiled) >= until_clients:
+                        stopped_because = "target_reached"
+                        break
+                    status = await client.get("/api/v1/profiler/status")
+                    if status.get("running"):
+                        seen_running = True
+                        ap = status
+                    elif seen_running or time.time() > started + STARTUP_GRACE_S:
+                        stopped_because = "profiler_exited"
+                        break
+                    if time.time() >= deadline:
+                        if not ask_to_extend or not await _keep_going(
+                            len(profiled), until_clients, max_minutes
+                        ):
+                            break
+                        deadline = time.time() + max_minutes * 60
+                    await asyncio.sleep(PROFILE_POLL_S)
+        finally:
+            # Also on cancel: never leave the profiler running for a task
+            # that no longer exists.
+            try:
+                await client.post("/api/v1/profiler/stop")
+            except Exception as exc:  # noqa: BLE001 - the run's outcome matters more
+                log.warning("stopping the profiler after profile_clients: %r", exc)
+
+        result = await build_reports(
+            client, output=output, max_clients=0, since=started
+        )
+        result["run"] = {
+            "clients_profiled": len(profiled),
+            "target": until_clients,
+            "elapsed_s": int(time.time() - started),
+            "stopped_because": stopped_because,
+        }
+        return result
+
+
+async def _keep_going(profiled: int, target: int, minutes: float) -> bool:
+    """Ask the user mid-task whether to profile for another ``minutes``."""
+    reply = await tasks.request_input(
+        elicit.form_request(
+            f"Only {profiled} of {target} clients profiled so far. Keep the "
+            f"profiler running for another {minutes:g} minutes?"
+        ),
+        label="extend",
+    )
+    return reply.get("action") == "accept"

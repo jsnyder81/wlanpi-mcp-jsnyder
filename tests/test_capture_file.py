@@ -23,6 +23,7 @@ from tests.test_capture_tools import (
     sessions_event,
     started_event,
 )
+from wlanpi_mcp import tasks
 from wlanpi_mcp.capture import storage
 from wlanpi_mcp.capture.ws_client import CaptureSocket
 from wlanpi_mcp.client.core_client import CoreAPIError
@@ -129,6 +130,80 @@ async def test_start_returns_immediately_then_writes_the_pcapng_file(capdir):
     data = path.read_bytes()
     assert data[:4] == b"\x0a\x0d\x0d\x0a"
     assert len(data) == entry.bytes_written > 0
+
+
+# ── start_pcap_file as an MCP Task (#90) ────────────────────────────────────
+
+
+async def _in_task(coro):
+    """Run ``coro`` as if under an MCP Task; return (task record, its job)."""
+    record = tasks.TaskRecord(task_id="t", tool="start_pcap_file", owner=None)
+
+    async def run():
+        tasks._current.set(record)
+        return await coro
+
+    return record, asyncio.create_task(run())
+
+
+async def test_under_a_task_start_completes_when_the_capture_ends(capdir):
+    _tmp, use = capdir
+    use(
+        StubWS(
+            [
+                AUTH_OK,
+                sessions_event(),
+                CONFIG_APPLIED,
+                started_event("cap_task"),
+                *pcapng_chunks(BEACON_A),
+                CAPTURE_ENDED,
+            ]
+        )
+    )
+    tools = _register()
+    record, job = await _in_task(
+        tools["start_pcap_file"].fn(channels=[6], duration_s=30)
+    )
+    result = await asyncio.wait_for(job, timeout=5)
+    assert result["status"] == "completed"
+    assert result["capture_id"] == "cap_task"
+    assert result["size_bytes"] > 0
+    assert "fetch_pcap_file(capture_id='cap_task')" in result["message"]
+    assert record.status_message.startswith("capture_id cap_task:")
+
+
+async def test_cancelling_the_task_stops_the_capture_and_keeps_the_file(capdir):
+    _tmp, use = capdir
+    stub = use(
+        BlockingWS(
+            [
+                AUTH_OK,
+                sessions_event(),
+                CONFIG_APPLIED,
+                started_event("cap_cancel"),
+                *pcapng_chunks(BEACON_A),
+            ]
+        )
+    )
+    tools = _register()
+    _record, job = await _in_task(
+        tools["start_pcap_file"].fn(channels=[6], duration_s=600)
+    )
+    entry = None
+    for _ in range(100):
+        entry = capture_file._CAPTURES.get("cap_cancel")
+        if entry is not None and entry.bytes_written:
+            break
+        await asyncio.sleep(0.01)
+    assert entry is not None
+
+    job.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await job
+    # Stopped the way stop_pcap_file stops it, not torn down mid-write.
+    assert entry.status == "stopped"
+    assert stub.commands[-1] == "stop" and stub.closed is True
+    assert Path(entry.path).read_bytes()[:4] == b"\x0a\x0d\x0d\x0a"
 
 
 async def test_start_rejects_a_busy_interface(capdir):

@@ -242,6 +242,12 @@ def _curl(pairs: list[tuple[str, str]]) -> str:
     return " ".join(parts)
 
 
+async def clients_since(client: CoreClient, since: float) -> list[str]:
+    """MACs of the clients profiled at or after ``since``, newest first."""
+    clients, _ = _from_manifest(await client.get(FILES_PATH))
+    return [c["mac"] for c in clients if c["_mtime"] >= since]
+
+
 async def build_reports(
     client: CoreClient,
     *,
@@ -250,8 +256,14 @@ async def build_reports(
     max_clients: int = 25,
     include_frame: bool = False,
     include_session_csv: bool = True,
+    since: float | None = None,
 ) -> dict[str, Any]:
-    """Build get_profiler_reports' result."""
+    """
+    get_profiler_reports' result, shared with profile_clients.
+
+    ``since`` (epoch seconds) keeps only clients whose newest file was
+    written at or after it: the clients one profiling run touched.
+    """
     if output not in ("json", "links", "zip"):
         return {"error": "output must be 'json', 'links' or 'zip'"}
     wanted = None
@@ -275,6 +287,8 @@ async def build_reports(
             }
         raise
     clients, reports = _from_manifest(manifest)
+    if since is not None:
+        clients = [c for c in clients if c["_mtime"] >= since]
     total = len(clients)
     if max_clients > 0:
         clients = clients[:max_clients]

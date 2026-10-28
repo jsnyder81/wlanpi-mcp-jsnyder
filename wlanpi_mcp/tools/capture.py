@@ -9,10 +9,12 @@ closes the socket before returning, so no ownerless capture is left running.
 """
 
 import logging
+import time
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
 
+from wlanpi_mcp import tasks
 from wlanpi_mcp.capture import storage
 from wlanpi_mcp.capture.dot11 import (
     DEFAULT_MAX_FRAMES,
@@ -141,23 +143,37 @@ async def _run_window(
 ) -> tuple[ScanTable, dict[str, Any]]:
     table = ScanTable()
     reader = PcapngReader()
-    events = await sock.consume(reader, table, duration_s, frame_log, raw_sink)
-    if owner and not events.get("capture_ended"):
-        # The capture window is over. Ask core to stop, then keep dissecting
-        # for a bounded margin: 'stop' flushes dumpcap's final frames and emits
-        # CAPTURE_STOPPED, and closing the socket the instant the window ended
-        # would cut those off. The same reader is reused so pcapng blocks that
-        # span the window boundary still parse. Drains early on CAPTURE_STOPPED.
-        window_ended = events.get("capture_ended", False)
-        window_closed = events.get("stream_closed", False)
-        await sock.stop()
-        events = await sock.consume(reader, table, STOP_DRAIN_S, frame_log, raw_sink)
-        # The drain always ends via our own stop (CAPTURE_STOPPED), so its
-        # end flags describe the stop, not the capture. Keep the window's own
-        # signal so 'capture_ended_early' means the capture died on its own,
-        # not that we stopped it normally. Counts stay cumulative.
-        events["capture_ended"] = window_ended
-        events["stream_closed"] = window_closed
+    started = time.monotonic()
+
+    def progress() -> str:
+        elapsed = min(int(time.monotonic() - started), duration_s)
+        issues = len(sock.channel_issues)
+        return (
+            f"{elapsed} of {duration_s} s: {len(table.aps)} APs, "
+            f"{frame_log.total} frames, {sock.channel_sets} channel changes"
+            + (f", {issues} channel issues (partial capture)" if issues else "")
+        )
+
+    async with tasks.reporting(progress):
+        events = await sock.consume(reader, table, duration_s, frame_log, raw_sink)
+        if owner and not events.get("capture_ended"):
+            # The capture window is over. Ask core to stop, then keep dissecting
+            # for a bounded margin: 'stop' flushes dumpcap's final frames and emits
+            # CAPTURE_STOPPED, and closing the socket the instant the window ended
+            # would cut those off. The same reader is reused so pcapng blocks that
+            # span the window boundary still parse. Drains early on CAPTURE_STOPPED.
+            window_ended = events.get("capture_ended", False)
+            window_closed = events.get("stream_closed", False)
+            await sock.stop()
+            events = await sock.consume(
+                reader, table, STOP_DRAIN_S, frame_log, raw_sink
+            )
+            # The drain always ends via our own stop (CAPTURE_STOPPED), so its
+            # end flags describe the stop, not the capture. Keep the window's own
+            # signal so 'capture_ended_early' means the capture died on its own,
+            # not that we stopped it normally. Counts stay cumulative.
+            events["capture_ended"] = window_ended
+            events["stream_closed"] = window_closed
     return table, events
 
 
@@ -241,7 +257,9 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
         device and its path returned in 'pcap_path' (fetch it with
         fetch_pcap_file to verify the summary against the frames). For a capture
         longer than the 60 s window, use the non-streaming file-capture tools
-        (start_pcap_file/fetch_pcap_file) instead.
+        (start_pcap_file/fetch_pcap_file) instead. Clients that support MCP
+        Tasks get it as a background task with live progress; the result is
+        the same.
 
         The result has two parts:
         - 'aps': one row per BSSID from beacons/probe-responses, with SSID,
@@ -429,7 +447,8 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
         taking control of it. This never starts, reconfigures or stops a
         capture; the role in the result is always 'subscriber'. The result
         includes the owner's running config (channels, width, dwell, filter),
-        so it is clear what the summary does and does not cover.
+        so it is clear what the summary does and does not cover. Clients that
+        support MCP Tasks get it as a background task with live progress.
 
         Returns the same dissected summary as capture_scan (an 'aps' table with
         full security detail, plus per-frame 'frames'/'frame_types' with

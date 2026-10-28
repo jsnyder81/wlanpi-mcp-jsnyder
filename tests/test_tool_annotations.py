@@ -18,6 +18,7 @@ DESTRUCTIVE = {
     "set_bluetooth_power",  # off drops Bluetooth links, including BT PAN access
     "renew_dhcp_lease",  # may change the address the client is using
     "start_profiler",  # takes an adapter over for its AP
+    "profile_clients",  # runs the profiler, as start_profiler does
     "stop_profiler",
     "purge_profiler_data",  # deletes saved profiles and reports
     "start_service",  # e.g. wlanpi-profiler takes a radio

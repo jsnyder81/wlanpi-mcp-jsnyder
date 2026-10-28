@@ -1,9 +1,11 @@
 """MCP tools for WLAN Pi utilities: reachability, speedtest, UFW, and blinker."""
 
+import time
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
 
+from wlanpi_mcp import tasks
 from wlanpi_mcp.client.core_client import CoreAPIError, CoreClient
 from wlanpi_mcp.tools import hints
 
@@ -74,9 +76,18 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
 
         Uses LibreSpeed CLI; slow, typically taking 30-90 seconds to complete.
         Returns download/upload speed, ping, IP address, and the test server
-        used.
+        used. Clients that support MCP Tasks get it as a background task.
         """
-        return await client.get("/api/v1/utils/speedtest", timeout=180.0)
+        started = time.monotonic()
+
+        def progress() -> str:
+            # Core runs the test in one blocking request, so elapsed time is
+            # all there is to report; it exposes no ping/download/upload phase.
+            elapsed = int(time.monotonic() - started)
+            return f"speed test running, {elapsed} s elapsed (usually 30-90 s)"
+
+        async with tasks.reporting(progress):
+            return await client.get("/api/v1/utils/speedtest", timeout=180.0)
 
     @mcp.tool(annotations=hints.ADDITIVE)
     async def start_blinker(interface: str = "eth0") -> dict[str, Any]:

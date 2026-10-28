@@ -35,7 +35,7 @@ from mcp.types import BlobResourceContents, EmbeddedResource
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response
 
-from wlanpi_mcp import download_links
+from wlanpi_mcp import download_links, tasks
 from wlanpi_mcp.capture import storage
 from wlanpi_mcp.capture.ws_client import (
     CaptureError,
@@ -223,6 +223,44 @@ async def _run_file_capture(
         entry.ended_at = time.time()
 
 
+async def _follow_as_task(entry: FileCapture) -> dict[str, Any]:
+    """
+    Under an MCP Task, hold start_pcap_file's call until the capture ends.
+
+    The capture itself still runs in its own background job; this only
+    waits on it, reporting progress, so the task completes with the final
+    capture result. tasks/cancel stops the capture the way stop_pcap_file
+    does: the file is kept, and the job's finally still stops and closes.
+    """
+
+    def progress() -> str:
+        elapsed = min(int(time.time() - entry.started_at), entry.duration_s)
+        return (
+            f"capture_id {entry.session_id}: {entry.bytes_written} bytes, "
+            f"{elapsed} of {entry.duration_s} s (stop early with stop_pcap_file)"
+        )
+
+    assert entry.task is not None
+    async with tasks.reporting(progress):
+        try:
+            # Shielded so a cancel stops the capture gracefully rather than
+            # cancelling the job mid-write.
+            await asyncio.shield(entry.task)
+        except asyncio.CancelledError:
+            entry.stop_event.set()
+            try:
+                await entry.task
+            except Exception as exc:  # noqa: BLE001 - status carries the error
+                log.debug("awaiting stopped capture task: %r", exc)
+            raise
+    result = entry.to_result()
+    result["message"] = (
+        f"capture {entry.status}; fetch it with "
+        f"fetch_pcap_file(capture_id='{entry.session_id}')"
+    )
+    return result
+
+
 def _prune_tickets(now: float) -> None:
     """Drop expired download tickets."""
     for ticket in [t for t, (_, exp) in _TICKETS.items() if exp <= now]:
@@ -272,6 +310,11 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
         its own until duration_s elapses or you call stop_pcap_file. Retrieve
         the file with fetch_pcap_file(capture_id=...) (a pcapng blob) once it
         has stopped.
+
+        Clients that support MCP Tasks get a task instead: it shows the
+        capture_id and bytes so far while the capture runs, and completes with
+        the final path, status and size when it ends. Cancelling the task
+        stops the capture and keeps the file; stop_pcap_file still works too.
 
         This tool always owns the interface. If a capture is already running on
         it, this returns an error rather than taking it over — watch that one
@@ -368,6 +411,8 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
             _CAPTURES[session_id] = entry
             spawned = True
 
+            if tasks.in_task():
+                return await _follow_as_task(entry)
             result = entry.to_result()
             result["message"] = (
                 f"capturing to {path} for up to {duration_s}s; fetch it with "

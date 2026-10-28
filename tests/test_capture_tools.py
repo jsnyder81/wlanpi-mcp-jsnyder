@@ -836,3 +836,27 @@ def test_connect_capture_ssl_matches_url_scheme(monkeypatch):
             assert isinstance(captured["ssl"], ssl.SSLContext)
         else:
             assert captured["ssl"] is None
+
+
+async def test_capture_scan_reports_progress_when_run_as_a_task(ws):
+    # #91: under an MCP Task the capture window reports APs and frames as it
+    # goes; the result itself is unchanged.
+    from wlanpi_mcp import tasks
+
+    ws.script = [
+        AUTH_OK,
+        sessions_event(),
+        CONFIG_APPLIED,
+        started_event("s_task"),
+        *pcapng_chunks(BEACON_A, BEACON_B),
+        CAPTURE_ENDED,
+    ]
+    tools, _ = _register()
+    record = tasks.TaskRecord(task_id="t", tool="capture_scan", owner=None)
+    reset = tasks._current.set(record)
+    try:
+        result = await tools["capture_scan"].fn(channels=[6], duration_s=1)
+    finally:
+        tasks._current.reset(reset)
+    assert result["ap_count"] == 2
+    assert record.status_message.endswith("2 APs, 2 frames, 0 channel changes")
