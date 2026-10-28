@@ -242,6 +242,135 @@ def _curl(pairs: list[tuple[str, str]]) -> str:
     return " ".join(parts)
 
 
+async def build_reports(
+    client: CoreClient,
+    *,
+    mac: str | None = None,
+    output: str = "json",
+    max_clients: int = 25,
+    include_frame: bool = False,
+    include_session_csv: bool = True,
+) -> dict[str, Any]:
+    """Build get_profiler_reports' result."""
+    if output not in ("json", "links", "zip"):
+        return {"error": "output must be 'json', 'links' or 'zip'"}
+    wanted = None
+    if mac:
+        wanted = _normalize_mac(mac)
+        if wanted is None:
+            return {"error": f"not a MAC address: {mac!r}"}
+
+    try:
+        manifest = await client.get(
+            FILES_PATH, params={"mac": wanted} if wanted else None
+        )
+    except CoreAPIError as exc:
+        # The listing route has no 404 of its own: core predates it.
+        if exc.status_code == 404:
+            return {
+                "error": (
+                    "this wlanpi-core has no profiler files endpoint "
+                    f"({FILES_PATH}); upgrade wlanpi-core to 2.4.8 or later"
+                )
+            }
+        raise
+    clients, reports = _from_manifest(manifest)
+    total = len(clients)
+    if max_clients > 0:
+        clients = clients[:max_clients]
+    result: dict[str, Any] = {
+        "total_clients": total,
+        "returned_clients": len(clients),
+        "truncated": len(clients) < total,
+    }
+    if wanted and not clients:
+        result["note"] = f"no profile for {wanted}"
+    elif total == 0:
+        result["note"] = (
+            "no client profiles: the profiler has not profiled a client "
+            "since its data was last purged"
+        )
+
+    if output == "json":
+        wanted_files = [
+            f for c in clients for f in c["files"] if f["name"].endswith(".json")
+        ]
+        fetched = {
+            f["path"]: data for f, data, _ in await _fetch_all(client, wanted_files)
+        }
+        result["clients"] = [
+            _parse_profiles(c, fetched, include_frame) for c in clients
+        ]
+        result["session_reports"] = [_public(r) for r in reports]
+        return result
+
+    files = [f for c in clients for f in c["files"]]
+    if include_session_csv:
+        files += reports
+    size = sum(f["size_bytes"] for f in files)
+    if size > MAX_DOWNLOAD_BYTES:
+        return {
+            "error": (
+                f"{len(files)} files, {size} bytes: over the "
+                f"{MAX_DOWNLOAD_BYTES} byte limit for one call. Narrow "
+                "it with mac or max_clients, or include_session_csv=false."
+            )
+        }
+    blobs = []
+    for f, data, media in await _fetch_all(client, files):
+        if isinstance(data, CoreAPIError):
+            log.warning("profiler report %s gone: %s", f["path"], data)
+        else:
+            blobs.append((f, data, media))
+
+    now = time.time()
+    _prune_tickets(now)
+    base = download_links.request_base_url()
+    result["expires_in_s"] = download_links.DOWNLOAD_TTL_S
+    result["single_use"] = True
+    result["clients"] = [{"mac": c["mac"], "modified": c["modified"]} for c in clients]
+
+    def link(route: str) -> dict[str, str]:
+        if base:
+            return {"download_url": f"{base}{route}"}
+        return {"download_path": route}
+
+    if output == "zip":
+        data = await asyncio.to_thread(_zip, blobs)
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        filename = f"profiler-reports-{stamp}.zip"
+        route = _mint(data, filename, "application/zip", now)
+        result.update(
+            {
+                "filename": filename,
+                "size_bytes": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "files": [f["path"] for f, _, _ in blobs],
+                **link(route),
+            }
+        )
+        if base:
+            result["curl"] = _curl([(filename, f"{base}{route}")])
+    else:
+        entries = []
+        pairs = []
+        for f, data, media in blobs:
+            route = _mint(data, f["name"], media, now)
+            entries.append({"path": f["path"], "size_bytes": len(data), **link(route)})
+            if base:
+                pairs.append((f"profiler/{f['path']}", f"{base}{route}"))
+        result["files"] = entries
+        if pairs:
+            result["curl"] = _curl(pairs)
+
+    if not base:
+        result["note"] = (
+            "no HTTP request context (stdio): prefix download_path with "
+            "this server's https://host:port"
+        )
+    return result
+
+
 def register(mcp: MCPServer, client: CoreClient) -> None:
     """Register get_profiler_reports and its download route."""
 
@@ -307,127 +436,14 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
         2.4.8 or later). A 401 from core means it refused this token: get a
         fresh one and reconnect.
         """
-        if output not in ("json", "links", "zip"):
-            return {"error": "output must be 'json', 'links' or 'zip'"}
-        wanted = None
-        if mac:
-            wanted = _normalize_mac(mac)
-            if wanted is None:
-                return {"error": f"not a MAC address: {mac!r}"}
-
-        try:
-            manifest = await client.get(
-                FILES_PATH, params={"mac": wanted} if wanted else None
-            )
-        except CoreAPIError as exc:
-            # The listing route has no 404 of its own: core predates it.
-            if exc.status_code == 404:
-                return {
-                    "error": (
-                        "this wlanpi-core has no profiler files endpoint "
-                        f"({FILES_PATH}); upgrade wlanpi-core to 2.4.8 or later"
-                    )
-                }
-            raise
-        clients, reports = _from_manifest(manifest)
-        total = len(clients)
-        if max_clients > 0:
-            clients = clients[:max_clients]
-        result: dict[str, Any] = {
-            "total_clients": total,
-            "returned_clients": len(clients),
-            "truncated": len(clients) < total,
-        }
-        if wanted and not clients:
-            result["note"] = f"no profile for {wanted}"
-        elif total == 0:
-            result["note"] = (
-                "no client profiles: the profiler has not profiled a client "
-                "since its data was last purged"
-            )
-
-        if output == "json":
-            wanted_files = [
-                f for c in clients for f in c["files"] if f["name"].endswith(".json")
-            ]
-            fetched = {
-                f["path"]: data for f, data, _ in await _fetch_all(client, wanted_files)
-            }
-            result["clients"] = [
-                _parse_profiles(c, fetched, include_frame) for c in clients
-            ]
-            result["session_reports"] = [_public(r) for r in reports]
-            return result
-
-        files = [f for c in clients for f in c["files"]]
-        if include_session_csv:
-            files += reports
-        size = sum(f["size_bytes"] for f in files)
-        if size > MAX_DOWNLOAD_BYTES:
-            return {
-                "error": (
-                    f"{len(files)} files, {size} bytes: over the "
-                    f"{MAX_DOWNLOAD_BYTES} byte limit for one call. Narrow "
-                    "it with mac or max_clients, or include_session_csv=false."
-                )
-            }
-        blobs = []
-        for f, data, media in await _fetch_all(client, files):
-            if isinstance(data, CoreAPIError):
-                log.warning("profiler report %s gone: %s", f["path"], data)
-            else:
-                blobs.append((f, data, media))
-
-        now = time.time()
-        _prune_tickets(now)
-        base = download_links.request_base_url()
-        result["expires_in_s"] = download_links.DOWNLOAD_TTL_S
-        result["single_use"] = True
-        result["clients"] = [
-            {"mac": c["mac"], "modified": c["modified"]} for c in clients
-        ]
-
-        def link(route: str) -> dict[str, str]:
-            if base:
-                return {"download_url": f"{base}{route}"}
-            return {"download_path": route}
-
-        if output == "zip":
-            data = await asyncio.to_thread(_zip, blobs)
-            stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-            filename = f"profiler-reports-{stamp}.zip"
-            route = _mint(data, filename, "application/zip", now)
-            result.update(
-                {
-                    "filename": filename,
-                    "size_bytes": len(data),
-                    "sha256": hashlib.sha256(data).hexdigest(),
-                    "files": [f["path"] for f, _, _ in blobs],
-                    **link(route),
-                }
-            )
-            if base:
-                result["curl"] = _curl([(filename, f"{base}{route}")])
-        else:
-            entries = []
-            pairs = []
-            for f, data, media in blobs:
-                route = _mint(data, f["name"], media, now)
-                entries.append(
-                    {"path": f["path"], "size_bytes": len(data), **link(route)}
-                )
-                if base:
-                    pairs.append((f"profiler/{f['path']}", f"{base}{route}"))
-            result["files"] = entries
-            if pairs:
-                result["curl"] = _curl(pairs)
-
-        if not base:
-            result["note"] = (
-                "no HTTP request context (stdio): prefix download_path with "
-                "this server's https://host:port"
-            )
-        return result
+        return await build_reports(
+            client,
+            mac=mac,
+            output=output,
+            max_clients=max_clients,
+            include_frame=include_frame,
+            include_session_csv=include_session_csv,
+        )
 
     @mcp.custom_route(REPORT_PREFIX + "{ticket}", methods=["GET"])
     async def download_profiler_report(request: Request) -> Response:
