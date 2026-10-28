@@ -169,6 +169,33 @@ def confirm_gate(
     return {"performed": False, "reason": "user declined or dismissed"}
 
 
+def confirm_input_requests(message: str) -> dict[str, Any]:
+    """Build the one confirm question for a task's inputRequests payload.
+
+    The same checkbox confirm_gate asks, carried in the Tasks extension's
+    in-task input_required route (see wlanpi_mcp.tasks) instead of an
+    input_required tool result: the task record holds it while parked and
+    tasks/update delivers the answer as a plain content dict.
+    """
+    return {
+        CONFIRM_KEY: ElicitRequest(
+            params=ElicitRequestFormParams(
+                message=message, requested_schema=_CONFIRM_SCHEMA
+            )
+        )
+    }
+
+
+def answer_confirms(answer: dict[str, Any] | None) -> bool:
+    """Whether a tasks/update answer content confirms the question.
+
+    Mirrors _accepted for the in-task route: an unchecked box still
+    arrives as a content dict, so the value decides; no answer at all (a
+    cancel's wake, or an update with no content) is a decline.
+    """
+    return (answer or {}).get("confirm") is True
+
+
 #: Marker inside the sealed state of a mid-flow confirm, so
 #: resume_with_state can tell our state from another mechanism's or junk.
 _STATE_MARK = "wlanpi-mcp/override-confirm"

@@ -10,9 +10,6 @@ teardown, which keeps running (detached) even when a cancel has published the
 outcome first, so no ownerless capture is left running.
 """
 
-import asyncio
-import contextlib
-import functools
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -256,7 +253,6 @@ class _StreamRun:
     tee_path: str | None = None
     record: tasks.TaskRecord | None = None
     stopped: bool = False
-    cancelling: bool = False
 
     async def window(self) -> dict[str, Any]:
         """Run the capture window and return the dissected summary."""
@@ -322,10 +318,7 @@ def _failed(exc: BaseException) -> dict[str, Any]:
 
 def _start_stream_task(run: _StreamRun) -> Any:
     """Register a task record, spawn the window in the background, answer."""
-    run.record = tasks.TASKS.create(
-        progress=run.progress,
-        cancel=functools.partial(_stop_for_cancel, run),
-    )
+    run.record = tasks.TASKS.create(progress=run.progress, cancel_work=True)
     tasks.spawn(
         run.record,
         run.window(),
@@ -342,24 +335,6 @@ def _start_stream_task(run: _StreamRun) -> Any:
         ),
         payload={"role": run.role, **run.extras},
     )
-
-
-async def _stop_for_cancel(run: _StreamRun) -> None:
-    """Stop a task-backed window, at most once, through its own teardown.
-
-    The first cancel delivers CancelledError to the window; the run's
-    teardown then sends the owner's stop and closes the socket, so the
-    ownership rule holds even when the publish lands while that teardown
-    finishes detached. A second cancel while the first is unwinding only
-    waits: re-cancelling would interrupt nothing but buys no determinism.
-    """
-    work = run.record.work if run.record is not None else None
-    if work is not None:
-        if not run.cancelling:
-            run.cancelling = True
-            work.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await work
 
 
 def register(mcp: MCPServer, client: CoreClient) -> None:
