@@ -1,11 +1,72 @@
 """MCP tools for WLAN Pi utilities: reachability, speedtest, UFW, and blinker."""
 
+import asyncio
+import contextlib
+import functools
+import logging
+import time
+from dataclasses import dataclass, field
 from typing import Any
 
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Context, MCPServer
 
+from wlanpi_mcp import tasks
 from wlanpi_mcp.client.core_client import CoreAPIError, CoreClient
 from wlanpi_mcp.tools import hints
+
+log = logging.getLogger(__name__)
+
+#: Core runs the whole LibreSpeed test inside this one request; it can take
+#: 30-90 s, so the HTTP wait gets a generous bound.
+SPEEDTEST_TIMEOUT_S = 180.0
+
+
+@dataclass
+class _SpeedtestRun:
+    """One speedtest request, awaited inline or as the body of an MCP task.
+
+    The phases (ping, download, upload) happen inside wlanpi-core's LibreSpeed
+    call and a single REST GET exposes none of them, so progress is elapsed
+    time only, and a cancel can only abandon the wait: the test itself runs to
+    completion on the device.
+    """
+
+    client: CoreClient
+    started: float = field(default_factory=time.monotonic)
+    record: tasks.TaskRecord | None = None
+    cancelling: bool = False
+
+    async def request(self) -> dict[str, Any]:
+        """Ask core for the speedtest result (the blocking path's body)."""
+        return await self.client.get(
+            "/api/v1/utils/speedtest", timeout=SPEEDTEST_TIMEOUT_S
+        )
+
+    def progress(self) -> str:
+        """Live statusMessage: how long the test has been running."""
+        return f"speedtest running for {int(time.monotonic() - self.started)}s"
+
+
+def _failed(exc: BaseException) -> dict[str, Any]:
+    """Map a background speedtest failure to the dict the task reports."""
+    log.exception("task-backed speedtest failed")
+    return {"error": f"speedtest failed: {type(exc).__name__}: {exc}"}
+
+
+async def _cancel_speedtest(run: _SpeedtestRun) -> None:
+    """Abort the wait for core at the asyncio-task level, at most once.
+
+    wlanpi-core exposes no way to stop a running speedtest, so this ends our
+    side only: the HTTP request is dropped and the test runs to completion on
+    the device. A second cancel while the first is unwinding only waits.
+    """
+    work = run.record.work if run.record is not None else None
+    if work is not None:
+        if not run.cancelling:
+            run.cancelling = True
+            work.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await work
 
 
 def register(mcp: MCPServer, client: CoreClient) -> None:
@@ -68,15 +129,44 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
         return await client.get("/api/v1/utils/ufw")
 
     @mcp.tool(annotations=hints.READ_ONLY)
-    async def run_speedtest() -> dict[str, Any]:
+    async def run_speedtest(
+        ctx: Context[Any, Any] | None = None,
+    ) -> dict[str, Any]:
         """
         Run an internet speed test from the WLAN Pi.
 
         Uses LibreSpeed CLI; slow, typically taking 30-90 seconds to complete.
         Returns download/upload speed, ping, IP address, and the test server
         used.
+
+        When your client supports MCP Tasks this call instead returns a task
+        handle right away: the test continues in the background and tasks/get
+        reports how long it has been running (the ping, download and upload
+        phases happen inside wlanpi-core and are not observable from here)
+        and, once terminal, the result this call would have returned, or an
+        error dict if the test failed. Cancelling the task abandons the wait;
+        the test itself still runs to completion on the device. Without task
+        support the call blocks and returns this result directly.
         """
-        return await client.get("/api/v1/utils/speedtest", timeout=180.0)
+        if not tasks.tasks_supported(ctx):
+            return await client.get(
+                "/api/v1/utils/speedtest", timeout=SPEEDTEST_TIMEOUT_S
+            )
+        run = _SpeedtestRun(client=client)
+        run.record = tasks.TASKS.create(
+            progress=run.progress,
+            cancel=functools.partial(_cancel_speedtest, run),
+        )
+        tasks.spawn(run.record, run.request(), on_error=_failed)
+        return tasks.task_call_result(
+            run.record,
+            message=(
+                f"running speedtest as task '{run.record.task_id}'; poll "
+                "tasks/get with that taskId for progress and the final result, "
+                "or tasks/cancel to stop waiting"
+            ),
+            payload={"status": "running"},
+        )
 
     @mcp.tool(annotations=hints.ADDITIVE)
     async def start_blinker(interface: str = "eth0") -> dict[str, Any]:

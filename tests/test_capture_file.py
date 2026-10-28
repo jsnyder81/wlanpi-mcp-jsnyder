@@ -18,6 +18,7 @@ from tests.test_capture_tools import (
     BEACON_B,
     CAPTURE_ENDED,
     CONFIG_APPLIED,
+    BlockingWS,
     StubWS,
     pcapng_chunks,
     session,
@@ -40,21 +41,6 @@ def _task_ctx(capable: bool) -> Context[Any, Any]:
     ctx.client_capabilities = TASK_CAPS if capable else ClientCapabilities()
     ctx.protocol_version = "2026-07-28"
     return ctx
-
-
-class BlockingWS(StubWS):
-    """Like StubWS but, once its script is exhausted, blocks instead of raising.
-
-    The capture stays 'running' until an early stop trips the poll.
-    """
-
-    async def recv(self):
-        if self.script:
-            item = self.script.pop(0)
-            if isinstance(item, BaseException):
-                raise item
-            return item
-        await asyncio.sleep(3600)
 
 
 @pytest.fixture(autouse=True)
@@ -224,7 +210,7 @@ async def test_start_as_task_returns_a_task_and_completes(capdir):
 
 async def test_task_progress_reports_bytes_written(capdir):
     _tmp, use = capdir
-    use(
+    stub = use(
         BlockingWS(
             [
                 AUTH_OK,
@@ -241,10 +227,9 @@ async def test_task_progress_reports_bytes_written(capdir):
     )
     record = tasks.TASKS.get(result.task_id)
     entry = capture_file._CAPTURES["cap_tkp"]
-    # Let the background task run until it has drained the delivered chunks
-    # and parked waiting for more: cooperative yields, no wall-clock wait.
-    while not entry.bytes_written:
-        await asyncio.sleep(0)
+    # The background run has drained the delivered chunks and parked waiting
+    # for more: fail fast rather than spin, if it ever does not.
+    await asyncio.wait_for(stub.parked.wait(), timeout=5)
 
     # While working, tasks/get reports the bytes written so far.
     assert f"{entry.bytes_written} bytes written" in tasks.wire(record)["statusMessage"]

@@ -156,11 +156,7 @@ def _resolve_session_path(session_id: str) -> str | None:
     entry = _CAPTURES.get(session_id)
     if entry is not None:
         return entry.path
-    safe = storage.safe_component(session_id)
-    matches = sorted(
-        glob.glob(os.path.join(storage.capture_dir(), f"capture-*-{safe}.pcapng"))
-    )
-    return matches[-1] if matches else None
+    return storage.latest_path(session_id)
 
 
 def _disk_captures() -> list[dict[str, Any]]:

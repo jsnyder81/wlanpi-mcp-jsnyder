@@ -31,6 +31,7 @@ from wlanpi_mcp.capture.ws_client import CaptureSocket
 from wlanpi_mcp.client.core_client import CoreClient
 from wlanpi_mcp.config import Settings
 from wlanpi_mcp.server import create_server
+from wlanpi_mcp.tools import capture as capture_tools
 from wlanpi_mcp.tools import capture_file
 
 MODERN = "2026-07-28"
@@ -159,6 +160,21 @@ def test_wire_carries_progress_message_while_working():
     assert out["pollIntervalMs"] == tasks.POLL_INTERVAL_MS
     tasks.TASKS.complete(record, {})
     assert "statusMessage" not in tasks.wire(record)
+
+
+async def test_spawn_survives_a_failing_teardown():
+    # A wedged socket must not turn the task (or tasks/cancel) into an error:
+    # the teardown failure is logged and the outcome still publishes.
+    async def bad_teardown():
+        raise OSError("wedged socket")
+
+    async def work():
+        return {"ok": True}
+
+    record = tasks.TASKS.create()
+    await asyncio.wait_for(tasks.spawn(record, work(), teardown=bad_teardown), 5)
+    assert record.status == "completed"
+    assert record.result == {"ok": True}
 
 
 # ── the capability gate ──────────────────────────────────────────────────────
@@ -454,3 +470,71 @@ async def test_tasks_get_on_an_older_wire_is_method_not_found(mcp):
             },
         )
     assert response.json()["error"]["code"] == -32601
+
+
+# ── capture_scan as a task, end to end over HTTP ─────────────────────────────
+
+
+@pytest.fixture
+async def scan_app(monkeypatch, tmp_path):
+    """Full server with the streaming capture socket stubbed and files in tmp."""
+    settings = Settings(PCAP_CAPTURE_DIR=str(tmp_path), _env_file=None)
+    monkeypatch.setattr(capture_tools, "get_settings", lambda: settings)
+    monkeypatch.setattr(storage, "get_settings", lambda: settings)
+
+    def use(stub):
+        async def fake_connect(_settings):
+            return CaptureSocket(stub, url="ws://test/api/v1/streaming/capture")
+
+        monkeypatch.setattr(capture_tools, "connect_capture", fake_connect)
+        return stub
+
+    mcp = create_server(CoreClient(settings))
+    return mcp, use
+
+
+async def test_capture_scan_to_a_task_client_returns_a_task(scan_app):
+    mcp, use = scan_app
+    use(
+        StubWS(
+            [
+                AUTH_OK,
+                sessions_event(),
+                CONFIG_APPLIED,
+                started_event("cap_http"),
+                *pcapng_chunks(BEACON_A),
+                CAPTURE_ENDED,
+            ]
+        )
+    )
+    req = _request(
+        "tools/call",
+        {"name": "capture_scan", "arguments": {"channels": [6], "duration_s": 5}},
+        name="capture_scan",
+    )
+    async with _serve(mcp) as http:
+        response = await http.post(
+            "/mcp",
+            json=req["json"],
+            headers={"Authorization": "Bearer t", **MCP_HEADERS, **req["headers"]},
+        )
+        assert response.status_code == 200, response.text
+        result = response.json()["result"]
+        assert result["resultType"] == "task"
+        assert result["status"] == "working"
+        task_id = result["taskId"]
+        assert result["structuredContent"]["session_id"] == "cap_http"
+
+        # The window runs in the background; await its end, then a single
+        # poll collects the outcome.
+        await asyncio.wait_for(tasks.TASKS.get(task_id).work, timeout=5)
+        get = _request("tasks/get", {"taskId": task_id})
+        poll = await http.post(
+            "/mcp",
+            json=get["json"],
+            headers={"Authorization": "Bearer t", **MCP_HEADERS, **get["headers"]},
+        )
+        body = poll.json()["result"]
+    assert body["status"] == "completed"
+    assert body["result"]["role"] == "owner"
+    assert body["result"]["ap_count"] == 1

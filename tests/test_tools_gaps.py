@@ -1,11 +1,14 @@
 """Tests for the coverage-gap tools added against wlanpi-core 2.1.11."""
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
 import respx
 from mcp.server.mcpserver import Context, MCPServer
+
+from tests.test_capture_tools import _task_ctx
 
 
 def _register(module):
@@ -189,3 +192,124 @@ async def test_start_bluetooth_pairing(client):
     )
     result = await client.post("/api/v1/bluetooth/pair")
     assert result["status"] == "pairing"
+
+
+# ── run_speedtest as an MCP Task (#91) ───────────────────────────────────────
+
+
+@pytest.fixture(autouse=True)
+def _clean_task_store():
+    from wlanpi_mcp import tasks
+
+    tasks.TASKS.clear()
+    yield
+    tasks.TASKS.clear()
+
+
+def _parking_get():
+    """Return a client.get stand-in, its start event and its release event."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def get(path, **kwargs):
+        started.set()
+        await release.wait()
+        return {"download_mbps": 100.0}
+
+    return get, started, release
+
+
+async def test_run_speedtest_as_task_completes_with_the_core_result():
+    from wlanpi_mcp import tasks
+    from wlanpi_mcp.tools import utils
+
+    tools, mock_client = _register(utils)
+    mock_client.get = AsyncMock(return_value={"download_mbps": 100.0})
+    result = await tools["run_speedtest"].run({}, _task_ctx(capable=True))
+
+    assert isinstance(result, tasks.TaskCallResult)
+    assert result.result_type == "task"
+    assert result.structured_content == {"status": "running"}
+    record = tasks.TASKS.get(result.task_id)
+    await asyncio.wait_for(record.work, timeout=5)
+    assert record.status == "completed"
+    assert record.result == {"download_mbps": 100.0}
+    mock_client.get.assert_called_once_with("/api/v1/utils/speedtest", timeout=180.0)
+
+
+async def test_run_speedtest_task_failure_publishes_an_error_result():
+    from wlanpi_mcp import tasks
+    from wlanpi_mcp.tools import utils
+
+    tools, mock_client = _register(utils)
+    mock_client.get = AsyncMock(side_effect=RuntimeError("core is down"))
+    result = await tools["run_speedtest"].run({}, _task_ctx(capable=True))
+    record = tasks.TASKS.get(result.task_id)
+    await asyncio.wait_for(record.work, timeout=5)
+
+    assert record.status == "failed"
+    assert "core is down" in record.result["error"]
+
+
+async def test_run_speedtest_task_progress_reports_elapsed_time():
+    from wlanpi_mcp import tasks
+    from wlanpi_mcp.tools import utils
+
+    tools, mock_client = _register(utils)
+    mock_client.get, started, _release = _parking_get()
+    result = await tools["run_speedtest"].run({}, _task_ctx(capable=True))
+    record = tasks.TASKS.get(result.task_id)
+    await asyncio.wait_for(started.wait(), timeout=5)
+
+    # The LibreSpeed phases live inside wlanpi-core; elapsed time is all this
+    # side can observe, so that is what the statusMessage carries.
+    assert tasks.wire(record)["statusMessage"].startswith("speedtest running for ")
+
+    await tasks.TASKS.cancel(record)
+    assert record.status == "cancelled"
+
+
+async def test_run_speedtest_task_cancel_abandons_the_wait():
+    from wlanpi_mcp import tasks
+    from wlanpi_mcp.tools import utils
+
+    tools, mock_client = _register(utils)
+    mock_client.get, started, _release = _parking_get()
+    result = await tools["run_speedtest"].run({}, _task_ctx(capable=True))
+    record = tasks.TASKS.get(result.task_id)
+    await asyncio.wait_for(started.wait(), timeout=5)
+
+    await tasks.TASKS.cancel(record)
+    # No cancel endpoint exists on core: the wait is abandoned at the
+    # asyncio-task level and the record goes terminal cancelled, with no
+    # result to report (tasks/get omits the key, as for any #90 cancel).
+    assert record.status == "cancelled"
+    assert record.result is None
+
+
+async def test_run_speedtest_task_cancel_after_completion_keeps_completed():
+    from wlanpi_mcp import tasks
+    from wlanpi_mcp.tools import utils
+
+    tools, mock_client = _register(utils)
+    mock_client.get = AsyncMock(return_value={"download_mbps": 100.0})
+    result = await tools["run_speedtest"].run({}, _task_ctx(capable=True))
+    record = tasks.TASKS.get(result.task_id)
+    await asyncio.wait_for(record.work, timeout=5)
+
+    await tasks.TASKS.cancel(record)
+    # The work was not cut short: the completed outcome stands.
+    assert record.status == "completed"
+    assert record.result == {"download_mbps": 100.0}
+
+
+async def test_run_speedtest_without_task_support_is_unchanged():
+    from wlanpi_mcp import tasks
+    from wlanpi_mcp.tools import utils
+
+    tools, mock_client = _register(utils)
+    result = await tools["run_speedtest"].run({}, _task_ctx(capable=False))
+
+    assert isinstance(result, dict)
+    mock_client.get.assert_called_once_with("/api/v1/utils/speedtest", timeout=180.0)
+    assert len(tasks.TASKS) == 0

@@ -11,6 +11,7 @@ path-confinement check — kept here (not in a tools module) so both tool module
 can import it without a circular dependency.
 """
 
+import glob
 import os
 import re
 import time
@@ -60,6 +61,18 @@ def session_from_filename(name: str) -> str:
     base = name[: -len(".pcapng")] if name.endswith(".pcapng") else name
     parts = base.split("-", 2)  # "capture", stamp, safe-capture-id
     return parts[2] if len(parts) == 3 else base
+
+
+def latest_path(capture_id: str) -> str | None:
+    """Return the newest pcapng file written for capture_id, or None if absent."""
+    safe = safe_component(capture_id)
+    try:
+        matches = sorted(
+            glob.glob(os.path.join(capture_dir(), f"capture-*-{safe}.pcapng"))
+        )
+    except OSError:
+        return None
+    return matches[-1] if matches else None
 
 
 def open_capture_file(capture_id: str) -> tuple[str, Any]:

@@ -5,14 +5,22 @@ wlanpi-core exposes capture only over `/api/v1/streaming/capture`, so these
 tools open that socket, authenticate with the same wlanpi-core JWT used for
 every REST call, run a bounded capture, and return a dissected summary. A
 capture lives with its socket: the owner flow always stops the capture and
-closes the socket before returning, so no ownerless capture is left running.
+closes the socket before the call ends. A task-backed window does this in its
+teardown, which keeps running (detached) even when a cancel has published the
+outcome first, so no ownerless capture is left running.
 """
 
+import asyncio
+import contextlib
+import functools
 import logging
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import Any
 
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Context, MCPServer
 
+from wlanpi_mcp import tasks
 from wlanpi_mcp.capture import storage
 from wlanpi_mcp.capture.dot11 import (
     DEFAULT_MAX_FRAMES,
@@ -138,8 +146,10 @@ async def _run_window(
     *,
     owner: bool = False,
     raw_sink: Any = None,
+    table: ScanTable | None = None,
 ) -> tuple[ScanTable, dict[str, Any]]:
-    table = ScanTable()
+    if table is None:
+        table = ScanTable()
     reader = PcapngReader()
     events = await sock.consume(reader, table, duration_s, frame_log, raw_sink)
     if owner and not events.get("capture_ended"):
@@ -168,20 +178,26 @@ async def _run_and_save(
     capture_id: str,
     *,
     owner: bool,
+    table: ScanTable | None = None,
+    on_open: Callable[[str], None] | None = None,
 ) -> tuple[ScanTable, dict[str, Any], dict[str, Any]]:
     """
     Run a capture window while teeing the raw pcapng to a file.
 
     The file lets the dissected summary be verified against the frames.
     Writing is best-effort — a storage problem never breaks the capture — and
-    the file is always closed. Returns ``(table, events, pcap_extra)`` where
-    pcap_extra carries ``pcap_path``/``pcap_bytes`` when the file was written.
+    the file is always closed. ``on_open``, if given, learns the tee path as
+    soon as it exists (so a run cut short can still point at its own file).
+    Returns ``(table, events, pcap_extra)`` where pcap_extra carries
+    ``pcap_path``/``pcap_bytes`` when the file was written.
     """
     path, fileobj = storage.try_open_capture_file(capture_id)
+    if path is not None and on_open is not None:
+        on_open(path)
     sink = fileobj.write if fileobj is not None else None
     try:
         table, events = await _run_window(
-            sock, duration_s, frame_log, owner=owner, raw_sink=sink
+            sock, duration_s, frame_log, owner=owner, raw_sink=sink, table=table
         )
     finally:
         if fileobj is not None:
@@ -218,6 +234,134 @@ def _summary(
     return result
 
 
+@dataclass
+class _StreamRun:
+    """One streaming capture window, run inline or as the body of an MCP task.
+
+    The task path hands the window to tasks.spawn so the tool call can return
+    a task handle while the socket keeps streaming (issue #91); the blocking
+    path awaits :meth:`window` inside the request, exactly as before.
+    ``table`` is created here rather than inside the window so a cancelled run
+    can still report the frames dissected so far.
+    """
+
+    sock: CaptureSocket
+    frame_log: FrameLog
+    duration_s: int
+    capture_id: str
+    owner: bool
+    role: str
+    extras: dict[str, Any]
+    table: ScanTable = field(default_factory=ScanTable)
+    tee_path: str | None = None
+    record: tasks.TaskRecord | None = None
+    stopped: bool = False
+    cancelling: bool = False
+
+    async def window(self) -> dict[str, Any]:
+        """Run the capture window and return the dissected summary."""
+        table, events, pcap = await _run_and_save(
+            self.sock,
+            self.duration_s,
+            self.frame_log,
+            self.capture_id,
+            owner=self.owner,
+            table=self.table,
+            on_open=self._note_tee,
+        )
+        # _run_window already stopped an owned capture (or it ended on its
+        # own), so the teardown must not send a second stop.
+        self.stopped = self.owner
+        return _summary(self.role, table, events, self.frame_log, **self.extras, **pcap)
+
+    def _note_tee(self, path: str) -> None:
+        # Record this run's own tee file the moment it opens, so partial()
+        # can never report another run's file.
+        self.tee_path = path
+
+    async def teardown(self) -> None:
+        """Stop (owner flows) and close the socket: never an ownerless capture."""
+        if self.owner and not self.stopped:
+            await self.sock.stop()
+        await self.sock.close()
+
+    def partial(self) -> dict[str, Any]:
+        """Summary of what a window cut short had dissected before it stopped."""
+        events = {
+            "channel_issues": list(self.sock.channel_issues),
+            "other_frames": self.table.other,
+            # The window was cut short by the cancel whatever the socket's
+            # own end flag reached: say so, so this result reads as partial.
+            "capture_ended": True,
+            "stream_closed": False,
+        }
+        result = _summary(self.role, self.table, events, self.frame_log, **self.extras)
+        if self.tee_path is not None:
+            result["pcap_path"] = self.tee_path
+            result["pcap_bytes"] = storage.file_size(self.tee_path)
+        return result
+
+    def progress(self) -> str:
+        """Live statusMessage: channels visited, frames counted, issues so far."""
+        message = (
+            f"visited {self.sock.channel_sets} channels, "
+            f"counted {self.frame_log.total} frames"
+        )
+        if self.sock.channel_issues:
+            message += f", {len(self.sock.channel_issues)} channel issue(s)"
+        return message
+
+
+def _failed(exc: BaseException) -> dict[str, Any]:
+    """Map a background window failure to the dict the blocking path returns."""
+    log.exception("task-backed capture failed")
+    if isinstance(exc, CaptureError):
+        return {"error": str(exc)}
+    return {"error": f"capture failed: {type(exc).__name__}: {exc}"}
+
+
+def _start_stream_task(run: _StreamRun) -> Any:
+    """Register a task record, spawn the window in the background, answer."""
+    run.record = tasks.TASKS.create(
+        progress=run.progress,
+        cancel=functools.partial(_stop_for_cancel, run),
+    )
+    tasks.spawn(
+        run.record,
+        run.window(),
+        teardown=run.teardown,
+        on_cancel=run.partial,
+        on_error=_failed,
+    )
+    return tasks.task_call_result(
+        run.record,
+        message=(
+            f"capturing for up to {run.duration_s}s as task "
+            f"'{run.record.task_id}'; poll tasks/get with that taskId for "
+            "progress and the final summary, or tasks/cancel to stop early"
+        ),
+        payload={"role": run.role, **run.extras},
+    )
+
+
+async def _stop_for_cancel(run: _StreamRun) -> None:
+    """Stop a task-backed window, at most once, through its own teardown.
+
+    The first cancel delivers CancelledError to the window; the run's
+    teardown then sends the owner's stop and closes the socket, so the
+    ownership rule holds even when the publish lands while that teardown
+    finishes detached. A second cancel while the first is unwinding only
+    waits: re-cancelling would interrupt nothing but buys no determinism.
+    """
+    work = run.record.work if run.record is not None else None
+    if work is not None:
+        if not run.cancelling:
+            run.cancelling = True
+            work.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await work
+
+
 def register(mcp: MCPServer, client: CoreClient) -> None:
     """Register the streaming capture tools."""
 
@@ -230,6 +374,7 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
         duration_s: int = DEFAULT_DURATION_S,
         pcap_filter: str = "",
         max_frames: int = DEFAULT_MAX_FRAMES,
+        ctx: Context[Any, Any] | None = None,
     ) -> dict[str, Any]:
         """
         Run a live streaming Wi-Fi packet capture and return what was on the air.
@@ -242,6 +387,15 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
         fetch_pcap_file to verify the summary against the frames). For a capture
         longer than the 60 s window, use the non-streaming file-capture tools
         (start_pcap_file/fetch_pcap_file) instead.
+
+        When your client supports MCP Tasks this call instead returns a task
+        handle right away: the capture continues in the background, tasks/get
+        reports the channels visited, frames counted and channel issues so far
+        and, once terminal, the outcome: the dissected summary this call would
+        have returned, or an error dict if the capture failed. tasks/cancel
+        stops the capture early; the task then reports what was dissected so
+        far. Without task support the call blocks and returns this summary
+        directly.
 
         The result has two parts:
         - 'aps': one row per BSSID from beacons/probe-responses, with SSID,
@@ -278,7 +432,8 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
             width: Channel width in MHz: 20, 40, 80 or 160.
             dwell_ms: Milliseconds to dwell on each channel (50-60000).
             duration_s: How long to capture, 1-60 seconds. The tool call
-                blocks for this whole window.
+                blocks for this whole window, unless your client supports MCP
+                Tasks, when it returns a task handle instead.
             pcap_filter: Optional BPF/pcap filter, e.g. 'type mgt subtype beacon'.
             max_frames: Cap on per-frame records returned in 'frames';
                 per-kind counts in 'frame_types' are always exact. Set 0 to
@@ -308,6 +463,7 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
 
         owns = False
         owner_stopped = False
+        spawned = False
         try:
             await sock.authenticate(token)
 
@@ -360,48 +516,53 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
                         raise
 
             if owns:
-                table, events, pcap = await _run_and_save(
-                    sock, duration_s, frame_log, session_id, owner=True
-                )
-                # _run_window already stopped the capture (or it ended on its
-                # own), so the finally must not send a second stop.
-                owner_stopped = True
-                return _summary(
-                    "owner",
-                    table,
-                    events,
-                    frame_log,
-                    session_id=session_id,
-                    interface=interface,
+                run = _StreamRun(
+                    sock=sock,
+                    frame_log=frame_log,
                     duration_s=duration_s,
-                    # Prefer core's snapshot of the running config over ours.
-                    config=sock.session_config
-                    or {"interfaces": config, "pcap_filter": pcap_filter or ""},
-                    **pcap,
+                    capture_id=session_id,
+                    owner=True,
+                    role="owner",
+                    extras={
+                        "session_id": session_id,
+                        "interface": interface,
+                        "duration_s": duration_s,
+                        # Prefer core's snapshot of the running config over ours.
+                        "config": sock.session_config
+                        or {"interfaces": config, "pcap_filter": pcap_filter or ""},
+                    },
+                )
+            else:
+                info = await sock.subscribe(existing[0]["session_id"])
+                run = _StreamRun(
+                    sock=sock,
+                    frame_log=frame_log,
+                    duration_s=duration_s,
+                    capture_id=info["session_id"],
+                    owner=False,
+                    role="subscriber",
+                    extras={
+                        "session_id": info["session_id"],
+                        "interface": interface,
+                        "duration_s": duration_s,
+                        "owner": info["owner"],
+                        "namespace": info["namespace"],
+                        "config": info["config"],
+                        "subscribed_because": (
+                            f"'{interface}' is already captured by session "
+                            f"{info['session_id']}; joined it read-only instead of "
+                            "taking it over"
+                        ),
+                    },
                 )
 
-            info = await sock.subscribe(existing[0]["session_id"])
-            table, events, pcap = await _run_and_save(
-                sock, duration_s, frame_log, info["session_id"], owner=False
-            )
-            return _summary(
-                "subscriber",
-                table,
-                events,
-                frame_log,
-                session_id=info["session_id"],
-                interface=interface,
-                duration_s=duration_s,
-                owner=info["owner"],
-                namespace=info["namespace"],
-                config=info["config"],
-                subscribed_because=(
-                    f"'{interface}' is already captured by session "
-                    f"{info['session_id']}; joined it read-only instead of "
-                    "taking it over"
-                ),
-                **pcap,
-            )
+            if tasks.tasks_supported(ctx):
+                result = _start_stream_task(run)
+                spawned = True
+                return result
+            result = await run.window()
+            owner_stopped = run.stopped
+            return result
         except CaptureError as exc:
             return {"error": str(exc)}
         except Exception as exc:
@@ -409,10 +570,12 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
             return {"error": f"capture failed: {type(exc).__name__}: {exc}"}
         finally:
             # Exception path: if we owned a capture but did not reach the
-            # graceful stop, stop it now so no ownerless capture is left.
-            if owns and not owner_stopped:
-                await sock.stop()
-            await sock.close()
+            # graceful stop, stop it now so no ownerless capture is left. A
+            # spawned task-backed window owns the socket itself instead.
+            if not spawned:
+                if owns and not owner_stopped:
+                    await sock.stop()
+                await sock.close()
 
     @mcp.tool(annotations=hints.ADDITIVE)
     async def capture_observe(
@@ -420,6 +583,7 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
         session_id: str | None = None,
         duration_s: int = DEFAULT_DURATION_S,
         max_frames: int = DEFAULT_MAX_FRAMES,
+        ctx: Context[Any, Any] | None = None,
     ) -> dict[str, Any]:
         """
         Watch a streaming capture another application is already running, read-only.
@@ -430,6 +594,15 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
         capture; the role in the result is always 'subscriber'. The result
         includes the owner's running config (channels, width, dwell, filter),
         so it is clear what the summary does and does not cover.
+
+        When your client supports MCP Tasks this call instead returns a task
+        handle right away: the capture continues in the background, tasks/get
+        reports the channels visited, frames counted and channel issues so far
+        and, once terminal, the outcome: the dissected summary this call would
+        have returned, or an error dict if the watch failed. tasks/cancel
+        detaches the watch early (the owner's capture keeps running); the task
+        then reports what was dissected so far. Without task support the call
+        blocks and returns this summary directly.
 
         Returns the same dissected summary as capture_scan (an 'aps' table with
         full security detail, plus per-frame 'frames'/'frame_types' with
@@ -447,7 +620,8 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
             interface: Instead of a session id, the monitor-mode capture
                 interface ('wlanpiN', e.g. 'wlanpi0') whose capture to watch.
             duration_s: How long to listen, 1-60 seconds. The tool call blocks
-                for this whole window.
+                for this whole window, unless your client supports MCP Tasks,
+                when it returns a task handle instead.
             max_frames: Cap on per-frame records in 'frames'; the
                 'frame_types' counts are always exact. Set 0 for AP table and
                 counts only, or a negative value for no cap (every frame).
@@ -465,6 +639,7 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
         except CaptureError as exc:
             return {"error": str(exc)}
 
+        spawned = False
         try:
             await sock.authenticate(token)
 
@@ -503,29 +678,36 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
                     }
 
             info = await sock.subscribe(target)
-            table, events, pcap = await _run_and_save(
-                sock, duration_s, frame_log, info["session_id"], owner=False
-            )
-            return _summary(
-                "subscriber",
-                table,
-                events,
-                frame_log,
-                session_id=info["session_id"],
+            run = _StreamRun(
+                sock=sock,
+                frame_log=frame_log,
                 duration_s=duration_s,
-                owner=info["owner"],
-                namespace=info["namespace"],
-                interfaces=info["interfaces"],
-                config=info["config"],
-                **pcap,
+                capture_id=info["session_id"],
+                owner=False,
+                role="subscriber",
+                extras={
+                    "session_id": info["session_id"],
+                    "duration_s": duration_s,
+                    "owner": info["owner"],
+                    "namespace": info["namespace"],
+                    "interfaces": info["interfaces"],
+                    "config": info["config"],
+                },
             )
+            if tasks.tasks_supported(ctx):
+                result = _start_stream_task(run)
+                spawned = True
+                return result
+            return await run.window()
         except CaptureError as exc:
             return {"error": str(exc)}
         except Exception as exc:
             log.exception("capture_observe failed")
             return {"error": f"capture failed: {type(exc).__name__}: {exc}"}
         finally:
-            await sock.close()
+            # A spawned task-backed window closes its own socket instead.
+            if not spawned:
+                await sock.close()
 
     @mcp.tool(annotations=hints.READ_ONLY)
     async def list_capture_sessions() -> dict[str, Any]:
