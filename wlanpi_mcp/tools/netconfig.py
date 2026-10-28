@@ -12,9 +12,10 @@ from wlanpi_mcp.client.core_client import CoreAPIError, CoreClient
 from wlanpi_mcp.tools import hints, netconfig_secrets
 
 # Core's 409 details (wlanpi_core/utils/network_config.py ConfigActiveError)
-# for the two cases override_active resolves. The other 409s (a change is
+# for the cases override_active resolves. The other 409s (a change is
 # running, WLAN_MANAGEMENT=manual) are not the user's call to override.
 _ANOTHER_ACTIVE = re.compile(r"^Another configuration is currently active: (.+)\.$")
+_ALREADY_ACTIVE = re.compile(r"^Configuration .+ is already active\.$")
 _NOT_ACTIVE = re.compile(r"^Configuration .+ is not active\.$")
 
 
@@ -209,11 +210,12 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
         Activate a saved profile.
 
         Always call with override_active=false first. Never set it true on
-        your own: if another profile is active, ask the user whether to replace
-        it, even if they already asked to activate this one. When the client
-        supports elicitation the server asks the user that question itself and
-        you get either the activation or the 409 back: do not ask again, and
-        if the error says the user declined, do not retry with
+        your own: if another profile is active, or this one already is, ask
+        the user whether to replace or re-apply it, even if they already asked
+        to activate this one. When the client supports elicitation the server
+        asks the user that question itself (and ignores an override_active you
+        set) and you get either the activation or the 409 back: do not ask
+        again, and if the error says the user declined, do not retry with
         override_active.
         Success does NOT mean every entry was applied: tell the user each
         outcomes[] entry's interface, status and detail.
@@ -234,8 +236,8 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
         404: no such profile.
         409: another change is running (nothing changed; retry
         shortly), WLAN_MANAGEMENT=manual (Core is not managing Wi-Fi; tell the
-        user), or a profile is already active (ask the user before retrying
-        with override_active=true).
+        user), or a profile, possibly this one, is already active (ask the
+        user before retrying with override_active=true).
 
         Args:
             id: Configuration profile ID to activate
@@ -245,30 +247,51 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
         if reply is not None:
             carried = elicit.state(ctx)
             if not reply.accepted:
+                active = carried.get("active")
+                what = (
+                    f"re-apply '{id}', which is already active"
+                    if active == id
+                    else f"replace the active profile '{active}'"
+                )
                 raise ToolError(
                     f"{carried.get('core_error', '')} The user declined to "
-                    f"replace the active profile '{carried.get('active')}'; "
-                    "nothing changed. Do not retry with override_active."
+                    f"{what}; nothing changed. Do not retry with override_active."
                 )
             override_active = True
+        elif elicit.can_form(ctx):
+            # The user answers this one, not the model: an override_active the
+            # model set itself must not skip the question. Core refuses only
+            # without the override, so drop it and let the 409 ask.
+            override_active = False
         try:
             return await client.post(
                 f"/api/v1/network/config/activate/{id}",
                 params={"override_active": override_active},
             )
         except CoreAPIError as exc:
-            match = _ANOTHER_ACTIVE.match(str(exc.detail))
-            if exc.status_code != 409 or match is None or not elicit.can_form(ctx):
+            if exc.status_code != 409 or not elicit.can_form(ctx):
                 raise
-            active = match.group(1)
+            detail = str(exc.detail)
+            if match := _ANOTHER_ACTIVE.match(detail):
+                active = match.group(1)
+                message = (
+                    f"Replace it with '{id}'? '{active}' is torn down first, "
+                    "so its connections drop."
+                )
+            elif _ALREADY_ACTIVE.match(detail):
+                active = id
+                message = (
+                    f"Re-apply it? '{id}' is torn down and set up again, so its "
+                    "connections drop briefly."
+                )
+            else:
+                raise
             name = await elicit.device_name(client)
             return elicit.ask(
                 ctx,
                 "replace_active",
                 elicit.form_request(
-                    f"'{active}' is the active network profile on {name}. "
-                    f"Replace it with '{id}'? '{active}' is torn down first, "
-                    "so its connections drop."
+                    f"'{active}' is the active network profile on {name}. {message}"
                 ),
                 active=active,
                 core_error=str(exc),
@@ -288,8 +311,9 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
         or WLAN_MANAGEMENT=manual. For 'not the active profile', override_active
         tears down that profile's entries anyway and returns every radio to
         root, which also disrupts whatever profile is active: ask the user
-        first. When the client supports elicitation the server asks itself;
-        if the error says the user declined, do not retry.
+        first. When the client supports elicitation the server asks itself
+        (and ignores an override_active you set); if the error says the user
+        declined, do not retry.
 
         Args:
             id: Configuration profile ID to deactivate
@@ -304,6 +328,9 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
                     "nothing changed. Do not retry with override_active."
                 )
             override_active = True
+        elif elicit.can_form(ctx):
+            # As in activate_network_config: the user answers, not the model.
+            override_active = False
         try:
             return await client.post(
                 f"/api/v1/network/config/deactivate/{id}",

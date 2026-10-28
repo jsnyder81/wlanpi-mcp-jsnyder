@@ -17,8 +17,9 @@ import respx
 from tests import wire
 from tests.test_server import _serve
 from wlanpi_mcp.client.core_client import CoreClient
+from wlanpi_mcp.config import Settings
 from wlanpi_mcp.server import create_server
-from wlanpi_mcp.tools import netconfig_secrets
+from wlanpi_mcp.tools import netconfig_secrets, system
 
 CORE = wire.CORE
 DEVICE_INFO = f"{CORE}/api/v1/system/device/info"
@@ -235,10 +236,45 @@ async def test_url_only_client_is_not_sent_a_form(mcp, _device_info):
     assert done["result"]["structuredContent"] == {"rebooting": True}
 
 
+async def test_a_retry_without_an_answer_asks_again(mcp, _device_info):
+    reboot = _device_info.post(f"{CORE}/api/v1/system/reboot").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    async with _serve(mcp) as http:
+        _key, _params, state = wire.question(
+            await wire.call(http, "reboot_device", capabilities=wire.FORM)
+        )
+        again = await wire.call(
+            http, "reboot_device", capabilities=wire.FORM, answers={}, state=state
+        )
+    wire.question(again)
+    assert not reboot.called
+
+
+@pytest.mark.parametrize("tool", ["reboot_device", "shutdown_device"])
+async def test_power_control_off_refuses_before_asking(
+    mcp, _device_info, monkeypatch, tool
+):
+    monkeypatch.setattr(
+        system,
+        "get_settings",
+        lambda: Settings(ALLOW_POWER_CONTROL=False, _env_file=None),
+    )
+    async with _serve(mcp) as http:
+        done = await wire.call(http, tool, capabilities=wire.FORM)
+    assert "Power control is disabled" in done["result"]["structuredContent"]["error"]
+
+
 # ── #86: replacing the active network profile ───────────────────────────────
 
 ACTIVATE = f"{CORE}/api/v1/network/config/activate/lab"
 DEACTIVATE = f"{CORE}/api/v1/network/config/deactivate/lab"
+
+
+def _not_active(request):
+    if request.url.params.get("override_active") == "true":
+        return httpx.Response(200, json={"id": "lab", "left_alone": []})
+    return httpx.Response(409, json={"detail": "Configuration lab is not active."})
 
 
 def _another_active(request):
@@ -320,7 +356,6 @@ async def test_activate_without_elicitation_keeps_the_409(mcp, _device_info):
     [
         "Another network configuration change is in progress",  # busy: retry
         "WLAN management is disabled (WLAN_MANAGEMENT=manual)",
-        "Configuration lab is already active.",
     ],
 )
 async def test_other_409s_are_not_offered_an_override(mcp, _device_info, detail):
@@ -361,6 +396,130 @@ async def test_deactivate_asks_before_tearing_down_an_inactive_profile(
         )
     assert done["result"]["structuredContent"]["id"] == "lab"
     assert route.call_count == 2
+
+
+async def test_activate_that_succeeds_is_not_confirmed(mcp, _device_info):
+    route = _device_info.post(url__startswith=ACTIVATE).mock(
+        return_value=httpx.Response(200, json={"id": "lab", "outcomes": []})
+    )
+    async with _serve(mcp) as http:
+        done = await wire.call(
+            http, "activate_network_config", {"id": "lab"}, capabilities=wire.FORM
+        )
+    assert done["result"]["structuredContent"]["id"] == "lab"
+    assert route.call_count == 1
+
+
+@pytest.mark.parametrize(
+    ("tool", "url", "refuse"),
+    [
+        ("activate_network_config", ACTIVATE, _another_active),
+        ("deactivate_network_config", DEACTIVATE, _not_active),
+    ],
+)
+async def test_override_set_by_the_model_cannot_skip_the_question(
+    mcp, _device_info, tool, url, refuse
+):
+    route = _device_info.post(url__startswith=url).mock(side_effect=refuse)
+    async with _serve(mcp) as http:
+        first = await wire.call(
+            http, tool, {"id": "lab", "override_active": True}, capabilities=wire.FORM
+        )
+    wire.question(first)
+    assert [c.request.url.params["override_active"] for c in route.calls] == ["false"]
+
+
+@pytest.mark.parametrize(
+    ("tool", "url", "refuse"),
+    [
+        ("activate_network_config", ACTIVATE, _another_active),
+        ("deactivate_network_config", DEACTIVATE, _not_active),
+    ],
+)
+async def test_override_passes_through_where_the_client_cannot_ask(
+    mcp, _device_info, tool, url, refuse
+):
+    # The model asked the user in chat, as the docstring tells it to.
+    route = _device_info.post(url__startswith=url).mock(side_effect=refuse)
+    async with _serve(mcp) as http:
+        done = await wire.call(
+            http, tool, {"id": "lab", "override_active": True}, capabilities=wire.NONE
+        )
+    assert done["result"]["structuredContent"]["id"] == "lab"
+    assert [c.request.url.params["override_active"] for c in route.calls] == ["true"]
+
+
+async def test_activate_already_active_asks_to_reapply(mcp, _device_info):
+    def respond(request):
+        if request.url.params.get("override_active") == "true":
+            return httpx.Response(200, json={"id": "lab", "outcomes": []})
+        return httpx.Response(
+            409, json={"detail": "Configuration lab is already active."}
+        )
+
+    route = _device_info.post(url__startswith=ACTIVATE).mock(side_effect=respond)
+    async with _serve(mcp) as http:
+        key, params, state = wire.question(
+            await wire.call(
+                http, "activate_network_config", {"id": "lab"}, capabilities=wire.FORM
+            )
+        )
+        assert "'lab' is the active network profile on wlanpi-9be" in params["message"]
+        assert "Re-apply it?" in params["message"]
+        declined = await wire.call(
+            http,
+            "activate_network_config",
+            {"id": "lab"},
+            capabilities=wire.FORM,
+            answers={key: wire.DECLINE},
+            state=state,
+        )
+        text = declined["result"]["content"][0]["text"]
+        assert "declined to re-apply 'lab', which is already active" in text
+        assert route.call_count == 1
+
+        done = await wire.call(
+            http,
+            "activate_network_config",
+            {"id": "lab"},
+            capabilities=wire.FORM,
+            answers={key: wire.accept()},
+            state=state,
+        )
+    assert done["result"]["structuredContent"]["id"] == "lab"
+    assert route.calls[-1].request.url.params["override_active"] == "true"
+
+
+async def test_deactivate_declined_returns_cores_409(mcp, _device_info):
+    route = _device_info.post(url__startswith=DEACTIVATE).mock(side_effect=_not_active)
+    async with _serve(mcp) as http:
+        key, _params, state = wire.question(
+            await wire.call(
+                http, "deactivate_network_config", {"id": "lab"}, capabilities=wire.FORM
+            )
+        )
+        done = await wire.call(
+            http,
+            "deactivate_network_config",
+            {"id": "lab"},
+            capabilities=wire.FORM,
+            answers={key: wire.DECLINE},
+            state=state,
+        )
+    text = done["result"]["content"][0]["text"]
+    assert done["result"]["isError"] is True
+    assert "Configuration lab is not active." in text and "declined" in text
+    assert route.call_count == 1
+
+
+async def test_deactivate_without_elicitation_keeps_the_409(mcp, _device_info):
+    _device_info.post(url__startswith=DEACTIVATE).mock(side_effect=_not_active)
+    async with _serve(mcp) as http:
+        done = await wire.call(
+            http, "deactivate_network_config", {"id": "lab"}, capabilities=wire.NONE
+        )
+    assert done["result"]["isError"] is True
+    assert "is not active" in done["result"]["content"][0]["text"]
 
 
 # ── #87: picking the scan adapter ───────────────────────────────────────────
@@ -454,6 +613,49 @@ async def test_scan_without_elicitation_returns_needs_selection(mcp, _device_inf
     async with _serve(mcp) as http:
         done = await wire.call(http, "scan_wlan", capabilities=wire.NONE)
     assert done["result"]["structuredContent"]["needsSelection"] is True
+
+
+async def test_scan_with_an_interface_given_never_asks(mcp, _device_info):
+    route = _device_info.get(url__startswith=SCAN).mock(side_effect=_scan)
+    async with _serve(mcp) as http:
+        done = await wire.call(
+            http, "scan_wlan", {"interface": "wlan1"}, capabilities=wire.FORM
+        )
+    assert done["result"]["structuredContent"]["networks"] == [{"ssid": "lab"}]
+    assert route.call_count == 1
+
+
+async def test_scan_same_iface_in_two_namespaces_stays_two_options(mcp, _device_info):
+    twins = [
+        {"iface": "wlan1", "namespace": "root", "label": "wlan1", "mode": "managed"},
+        {"iface": "wlan1", "namespace": "lab", "label": "wlan1", "mode": "managed"},
+    ]
+    _device_info.get(url__startswith=SCAN).mock(
+        return_value=httpx.Response(
+            200, json={"needsSelection": True, "candidates": twins, "networks": []}
+        )
+    )
+    async with _serve(mcp) as http:
+        _key, params, _state = wire.question(
+            await wire.call(http, "scan_wlan", capabilities=wire.FORM)
+        )
+    options = params["requestedSchema"]["properties"]["adapter"]["oneOf"]
+    assert [o["const"] for o in options] == ["root/wlan1", "lab/wlan1"]
+    assert len({o["title"] for o in options}) == 2
+
+
+async def test_scan_retry_without_an_answer_asks_again(mcp, _device_info):
+    route = _device_info.get(url__startswith=SCAN).mock(side_effect=_scan)
+    async with _serve(mcp) as http:
+        _key, _params, state = wire.question(
+            await wire.call(http, "scan_wlan", capabilities=wire.FORM)
+        )
+        wire.question(
+            await wire.call(
+                http, "scan_wlan", capabilities=wire.FORM, answers={}, state=state
+            )
+        )
+    assert all("iface" not in c.request.url.params for c in route.calls)
 
 
 # ── #89: passphrases through a page on the WLAN Pi ──────────────────────────
