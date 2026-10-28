@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 import respx
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Context, MCPServer
 
 
 def _register(module):
@@ -37,7 +37,7 @@ async def test_reboot_allowed_by_default(monkeypatch):
 
     monkeypatch.delenv("ALLOW_POWER_CONTROL", raising=False)
     tools, mock_client = _register(system)
-    await tools["reboot_device"].fn()
+    await tools["reboot_device"].fn(ctx=Context())
     mock_client.post.assert_called_once_with("/api/v1/system/reboot")
 
 
@@ -47,7 +47,7 @@ async def test_reboot_blocked_when_power_control_disabled(monkeypatch):
 
     monkeypatch.setenv("ALLOW_POWER_CONTROL", "false")
     tools, mock_client = _register(system)
-    result = await tools["reboot_device"].fn()
+    result = await tools["reboot_device"].fn(ctx=Context())
     assert "error" in result
     mock_client.post.assert_not_called()
 
@@ -58,7 +58,7 @@ async def test_shutdown_blocked_when_power_control_disabled(monkeypatch):
 
     monkeypatch.setenv("ALLOW_POWER_CONTROL", "false")
     tools, mock_client = _register(system)
-    result = await tools["shutdown_device"].fn()
+    result = await tools["shutdown_device"].fn(ctx=Context())
     assert "error" in result
     mock_client.post.assert_not_called()
 

@@ -2,8 +2,10 @@
 
 from typing import Any
 
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Context, MCPServer
+from mcp_types import InputRequiredResult
 
+from wlanpi_mcp import elicit
 from wlanpi_mcp.client.core_client import CoreClient
 from wlanpi_mcp.config import get_settings
 from wlanpi_mcp.tools import hints
@@ -122,33 +124,59 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
         return await client.post("/api/v1/system/timezone/auto")
 
     @mcp.tool(annotations=hints.DESTRUCTIVE)
-    async def reboot_device() -> dict[str, Any]:
+    async def reboot_device(ctx: Context) -> dict[str, Any] | InputRequiredResult:
         """
         Reboot the WLAN Pi immediately.
 
         Active sessions and captures will be interrupted. Can be disabled via
-        ALLOW_POWER_CONTROL=false in the server config.
+        ALLOW_POWER_CONTROL=false in the server config. When the client
+        supports elicitation, the user is asked to confirm directly; a
+        'not_performed' status means they declined - do not retry.
         """
         if not get_settings().ALLOW_POWER_CONTROL:
             return {
                 "error": "Power control is disabled. Set ALLOW_POWER_CONTROL=true "
                 "in /etc/wlanpi-mcp/config.env to allow reboot/shutdown."
             }
+
+        async def message() -> str:
+            name = await elicit.device_name(client)
+            return (
+                f"Reboot {name} now? Active captures, the profiler and every "
+                "connection to it will be interrupted until it is back up."
+            )
+
+        stop = await elicit.confirm(ctx, "reboot", message, "reboot the device")
+        if stop is not None:
+            return stop
         return await client.post("/api/v1/system/reboot")
 
     @mcp.tool(annotations=hints.DESTRUCTIVE)
-    async def shutdown_device() -> dict[str, Any]:
+    async def shutdown_device(ctx: Context) -> dict[str, Any] | InputRequiredResult:
         """
         Shut down the WLAN Pi immediately.
 
         The device must be powered back on manually. Can be disabled via
-        ALLOW_POWER_CONTROL=false in the server config.
+        ALLOW_POWER_CONTROL=false in the server config. When the client
+        supports elicitation, the user is asked to confirm directly; a
+        'not_performed' status means they declined - do not retry.
         """
         if not get_settings().ALLOW_POWER_CONTROL:
             return {
                 "error": "Power control is disabled. Set ALLOW_POWER_CONTROL=true "
                 "in /etc/wlanpi-mcp/config.env to allow reboot/shutdown."
             }
+
+        async def message() -> str:
+            name = await elicit.device_name(client)
+            return (
+                f"Shut down {name} now? It stays off until someone powers it "
+                "back on by hand, and every connection to it is lost."
+            )
+
+        stop = await elicit.confirm(ctx, "shutdown", message, "shut down the device")
+        if stop is not None:
+            return stop
         return await client.post("/api/v1/system/shutdown")
 
     @mcp.tool(annotations=hints.READ_ONLY)

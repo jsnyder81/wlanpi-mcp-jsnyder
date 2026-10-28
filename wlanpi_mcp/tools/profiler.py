@@ -2,8 +2,10 @@
 
 from typing import Any
 
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Context, MCPServer
+from mcp_types import InputRequiredResult
 
+from wlanpi_mcp import elicit
 from wlanpi_mcp.client.core_client import CoreClient
 from wlanpi_mcp.tools import hints
 
@@ -116,13 +118,17 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
         return await client.post("/api/v1/profiler/stop")
 
     @mcp.tool(annotations=hints.DESTRUCTIVE)
-    async def purge_profiler_data() -> dict[str, Any]:
+    async def purge_profiler_data(
+        ctx: Context,
+    ) -> dict[str, Any] | InputRequiredResult:
         """
         Delete every profiler client profile, capture and session report.
 
         This cannot be undone. Always confirm with the user first, and only
         call it when they asked to clear the profiler's saved data - never as
-        cleanup after a profiling run.
+        cleanup after a profiling run. When the client supports elicitation,
+        the user is asked to confirm directly; a 'not_performed' status means
+        they declined - do not retry.
 
         Returns {"files": N, "bytes": N}: how many files and symlinks were
         removed and their total size.
@@ -131,4 +137,17 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
         it (stop_profiler) and wait for get_profiler_status to show it stopped,
         then retry.
         """
+
+        async def message() -> str:
+            name = await elicit.device_name(client)
+            return (
+                f"Delete every saved profiler client profile, capture and "
+                f"report on {name}? This cannot be undone."
+            )
+
+        stop = await elicit.confirm(
+            ctx, "purge", message, "delete the profiler's saved data"
+        )
+        if stop is not None:
+            return stop
         return await client.post("/api/v1/profiler/purge")

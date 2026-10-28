@@ -14,8 +14,9 @@ from wlanpi_mcp.auth.token_context import current_request, current_token
 
 #: Path prefixes served without a Bearer token because the route itself checks
 #: a one-time ticket (tools/capture_file.py DOWNLOAD_PREFIX,
-#: tools/profiler_reports.py REPORT_PREFIX). Keep in sync.
-TICKET_PATH_PREFIXES = ("/pcap/", "/profiler-report/")
+#: tools/profiler_reports.py REPORT_PREFIX, tools/netconfig_secrets.py
+#: SECRET_PREFIX, whose page a browser opens with no JWT). Keep in sync.
+TICKET_PATH_PREFIXES = ("/pcap/", "/profiler-report/", "/netconfig-secret/")
 
 
 def _principal_for(token: str) -> AuthenticatedUser:

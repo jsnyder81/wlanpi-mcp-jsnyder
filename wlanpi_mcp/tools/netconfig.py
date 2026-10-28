@@ -1,11 +1,21 @@
 """MCP tools for managing saved network configuration profiles."""
 
+import re
 from typing import Any, NotRequired, TypedDict
 
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Context, MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+from mcp_types import InputRequiredResult
 
-from wlanpi_mcp.client.core_client import CoreClient
-from wlanpi_mcp.tools import hints
+from wlanpi_mcp import download_links, elicit
+from wlanpi_mcp.client.core_client import CoreAPIError, CoreClient
+from wlanpi_mcp.tools import hints, netconfig_secrets
+
+# Core's 409 details (wlanpi_core/utils/network_config.py ConfigActiveError)
+# for the two cases override_active resolves. The other 409s (a change is
+# running, WLAN_MANAGEMENT=manual) are not the user's call to override.
+_ANOTHER_ACTIVE = re.compile(r"^Another configuration is currently active: (.+)\.$")
+_NOT_ACTIVE = re.compile(r"^Configuration .+ is not active\.$")
 
 
 # Top-level shape of wlanpi-core's NetConfig / NetConfigUpdate. Typed so the
@@ -30,6 +40,7 @@ class NetConfigUpdate(TypedDict, total=False):
 
 def register(mcp: MCPServer, client: CoreClient) -> None:
     """Register the network configuration management tools."""
+    netconfig_secrets.register_routes(mcp)
 
     @mcp.tool(annotations=hints.READ_ONLY)
     async def get_network_config_status() -> dict[str, Any]:
@@ -65,7 +76,9 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
         return await client.get(f"/api/v1/network/config/{id}")
 
     @mcp.tool(annotations=hints.ADDITIVE)
-    async def create_network_config(config: NetConfig) -> dict[str, Any]:
+    async def create_network_config(
+        config: NetConfig, ctx: Context
+    ) -> dict[str, Any] | InputRequiredResult:
         """
         Create a saved network configuration profile.
 
@@ -80,6 +93,13 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
         password, client_cert, private_key and ca_cert, but core does not
         apply them today: PMF is fixed by the security type and there is no
         EAP security type - don't set them.
+        Passphrases: when the client supports URL elicitation, leave psk out
+        of a WPA2-PSK/WPA3-PSK entry and don't ask for it in the chat: the
+        server asks the user to type it into a page on the WLAN Pi, so it
+        never passes through the conversation, then creates the profile. A
+        'not_performed' status means they declined. Otherwise a PSK entry
+        needs psk set; without one core saves the profile but it cannot
+        connect when activated.
         Rejected with 422: WPA2-PSK psk not 8-63 printable ASCII or 64 hex;
         WPA3-PSK psk not a passphrase (no 64-hex); two entries with the same
         interface; a display name equal to another entry's interface; a
@@ -88,7 +108,67 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
         Args:
             config: {id, namespaces?, roots?}; namespaces and roots are lists of entries
         """
-        return await client.post("/api/v1/network/config/", json=config)
+        slots = netconfig_secrets.slots_needing_secret(dict(config))
+        route = elicit.state(ctx).get("secret_route")
+        if route is None:
+            base = download_links.request_base_url()
+            if not slots or not elicit.can_url(ctx) or base is None:
+                # As before: core stores a PSK entry without one, and it
+                # fails only when activated.
+                return await client.post("/api/v1/network/config/", json=config)
+            refused = await download_links.check_token(client)
+            if refused:
+                return {"error": refused}
+            route = netconfig_secrets.mint(config["id"], slots)
+            networks = ", ".join(f"'{s.ssid}'" for s in slots)
+            return elicit.ask(
+                ctx,
+                "secret_page",
+                elicit.url_request(
+                    f"Network profile '{config['id']}' needs the Wi-Fi "
+                    f"passphrase for {networks}. Open the WLAN Pi's page to "
+                    "type it there, so it never goes through the AI "
+                    "conversation. The page uses the WLAN Pi's own "
+                    "certificate, so your browser may warn about it first.",
+                    f"{base}{route}",
+                ),
+                secret_route=route,
+            )
+
+        declined = [
+            reply
+            for key in ("secret_page", "secret_done")
+            if (reply := elicit.answer(ctx, key)) is not None and not reply.accepted
+        ]
+        if declined:
+            netconfig_secrets.discard(route)
+            return elicit.not_performed(
+                f"enter the Wi-Fi passphrase, so profile '{config['id']}' was not created"
+            )
+        try:
+            filled = netconfig_secrets.take(route)
+        except netconfig_secrets.TicketGone:
+            return {
+                "error": (
+                    "the passphrase page expired or was already used; call "
+                    "create_network_config again to get a new one"
+                )
+            }
+        if filled is None:
+            # The client usually retries as soon as the page opens, before
+            # the user has typed anything: wait for them to say they're done.
+            return elicit.ask(
+                ctx,
+                "secret_done",
+                elicit.form_request(
+                    "Enter the passphrase on the WLAN Pi page and press Save, "
+                    f"then accept here to create profile '{config['id']}'."
+                ),
+            )
+        return await client.post(
+            "/api/v1/network/config/",
+            json=netconfig_secrets.apply(dict(config), filled),
+        )
 
     @mcp.tool(annotations=hints.DESTRUCTIVE)
     async def update_network_config(
@@ -114,14 +194,18 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
 
     @mcp.tool(annotations=hints.DESTRUCTIVE)
     async def activate_network_config(
-        id: str, override_active: bool = False
-    ) -> dict[str, Any]:
+        id: str, ctx: Context, override_active: bool = False
+    ) -> dict[str, Any] | InputRequiredResult:
         """
         Activate a saved profile.
 
         Always call with override_active=false first. Never set it true on
         your own: if another profile is active, ask the user whether to replace
-        it, even if they already asked to activate this one.
+        it, even if they already asked to activate this one. When the client
+        supports elicitation the server asks the user that question itself and
+        you get either the activation or the 409 back: do not ask again, and
+        if the error says the user declined, do not retry with
+        override_active.
         Success does NOT mean every entry was applied: tell the user each
         outcomes[] entry's interface, status and detail.
         connected/provisioned: applied (provisioned with detail "does not
@@ -148,15 +232,43 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
             id: Configuration profile ID to activate
             override_active: Tear down the active profile first; only after the user confirms
         """
-        return await client.post(
-            f"/api/v1/network/config/activate/{id}",
-            params={"override_active": override_active},
-        )
+        reply = elicit.answer(ctx, "replace_active")
+        if reply is not None:
+            carried = elicit.state(ctx)
+            if not reply.accepted:
+                raise ToolError(
+                    f"{carried.get('core_error', '')} The user declined to "
+                    f"replace the active profile '{carried.get('active')}'; "
+                    "nothing changed. Do not retry with override_active."
+                )
+            override_active = True
+        try:
+            return await client.post(
+                f"/api/v1/network/config/activate/{id}",
+                params={"override_active": override_active},
+            )
+        except CoreAPIError as exc:
+            match = _ANOTHER_ACTIVE.match(str(exc.detail))
+            if exc.status_code != 409 or match is None or not elicit.can_form(ctx):
+                raise
+            active = match.group(1)
+            name = await elicit.device_name(client)
+            return elicit.ask(
+                ctx,
+                "replace_active",
+                elicit.form_request(
+                    f"'{active}' is the active network profile on {name}. "
+                    f"Replace it with '{id}'? '{active}' is torn down first, "
+                    "so its connections drop."
+                ),
+                active=active,
+                core_error=str(exc),
+            )
 
     @mcp.tool(annotations=hints.DESTRUCTIVE)
     async def deactivate_network_config(
-        id: str, override_active: bool = False
-    ) -> dict[str, Any]:
+        id: str, ctx: Context, override_active: bool = False
+    ) -> dict[str, Any] | InputRequiredResult:
         """
         Deactivate the active profile; 'default' becomes current.
 
@@ -164,29 +276,82 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
         holding radios that Core did not remove: show them to the user, and
         offer reset_network_namespaces only if the user asks to clear them.
         Errors: 404 no such profile; 409 busy (retry), not the active profile,
-        or WLAN_MANAGEMENT=manual.
+        or WLAN_MANAGEMENT=manual. For 'not the active profile', override_active
+        tears down that profile's entries anyway and returns every radio to
+        root, which also disrupts whatever profile is active: ask the user
+        first. When the client supports elicitation the server asks itself;
+        if the error says the user declined, do not retry.
 
         Args:
             id: Configuration profile ID to deactivate
             override_active: Deactivate even if this profile is not the active one
         """
-        return await client.post(
-            f"/api/v1/network/config/deactivate/{id}",
-            params={"override_active": override_active},
-        )
+        reply = elicit.answer(ctx, "deactivate_inactive")
+        if reply is not None:
+            if not reply.accepted:
+                raise ToolError(
+                    f"{elicit.state(ctx).get('core_error', '')} The user declined "
+                    f"to deactivate '{id}' while it is not the active profile; "
+                    "nothing changed. Do not retry with override_active."
+                )
+            override_active = True
+        try:
+            return await client.post(
+                f"/api/v1/network/config/deactivate/{id}",
+                params={"override_active": override_active},
+            )
+        except CoreAPIError as exc:
+            if (
+                exc.status_code != 409
+                or not _NOT_ACTIVE.match(str(exc.detail))
+                or not elicit.can_form(ctx)
+            ):
+                raise
+            name = await elicit.device_name(client)
+            return elicit.ask(
+                ctx,
+                "deactivate_inactive",
+                elicit.form_request(
+                    f"'{id}' is not the active network profile on {name}. "
+                    "Deactivate it anyway? Its entries are torn down and every "
+                    "radio returns to the root namespace, which also disrupts "
+                    "the profile that is active now."
+                ),
+                core_error=str(exc),
+            )
 
     @mcp.tool(annotations=hints.DESTRUCTIVE)
-    async def delete_network_config(id: str, force: bool = False) -> dict[str, Any]:
+    async def delete_network_config(
+        id: str, ctx: Context, force: bool = False
+    ) -> dict[str, Any] | InputRequiredResult:
         """
         Delete a saved profile.
 
         Deleting the active profile is 409 unless force is set, which
         deactivates it first. 409 also means another change is running (retry).
+        With force, the user is asked to confirm directly when the client
+        supports elicitation; a 'not_performed' status means they declined -
+        do not retry.
 
         Args:
             id: Configuration profile ID to delete
             force: Deactivate and delete the profile even if it is active
         """
+        if force:
+
+            async def message() -> str:
+                name = await elicit.device_name(client)
+                return (
+                    f"Delete network profile '{id}' on {name}, deactivating it "
+                    "first if it is active? Its connections drop and the saved "
+                    "profile, including its passphrases, is gone."
+                )
+
+            stop = await elicit.confirm(
+                ctx, "force_delete", message, f"delete network profile '{id}'"
+            )
+            if stop is not None:
+                return stop
         return await client.delete(
             f"/api/v1/network/config/{id}",
             params={"force": force},
@@ -203,7 +368,9 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
         return await client.get("/api/v1/network/config/leftovers")
 
     @mcp.tool(annotations=hints.DESTRUCTIVE)
-    async def reset_network_namespaces(namespaces: list[str]) -> dict[str, Any]:
+    async def reset_network_namespaces(
+        namespaces: list[str], ctx: Context
+    ) -> dict[str, Any] | InputRequiredResult:
         """
         DESTRUCTIVE: clear the named namespaces, including other tools' ones.
 
@@ -218,9 +385,27 @@ def register(mcp: MCPServer, client: CoreClient) -> None:
         Errors: 422 invalid or empty name list; 409 busy (retry) or
         WLAN_MANAGEMENT=manual.
 
+        When the client supports elicitation, the server also asks the user
+        to confirm the exact names; a 'not_performed' status means they
+        declined - do not retry.
+
         Args:
             namespaces: Namespace names the user confirmed for reset
         """
+        listed = ", ".join(f"'{n}'" for n in namespaces) or "(none)"
+
+        async def message() -> str:
+            name = await elicit.device_name(client)
+            return (
+                f"Clear the network namespaces {listed} on {name}? Every radio "
+                "in them returns to root, including ones other tools are using."
+            )
+
+        stop = await elicit.confirm(
+            ctx, "reset_namespaces", message, f"reset namespaces {listed}"
+        )
+        if stop is not None:
+            return stop
         return await client.post(
             "/api/v1/network/config/reset", json={"namespaces": namespaces}
         )

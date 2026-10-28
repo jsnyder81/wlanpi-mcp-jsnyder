@@ -19,3 +19,21 @@ ADDITIVE = ToolAnnotations(destructiveHint=False)
 #: Removes or overwrites state, or interrupts something in use (a service,
 #: a radio, a link, the device itself).
 DESTRUCTIVE = ToolAnnotations(destructiveHint=True)
+
+#: DESTRUCTIVE tools that ask the user to confirm through MCP elicitation
+#: (wlanpi_mcp/elicit.py confirm()) when the client supports it, instead of
+#: relying on the model to ask. The server owns these confirms, so a client
+#: or extension should not add its own on top. Every name here must be
+#: DESTRUCTIVE; tests/test_tool_annotations.py pins that.
+CONFIRMED = frozenset(
+    {
+        "reboot_device",
+        "shutdown_device",
+        "purge_profiler_data",
+        "delete_network_config",  # only with force=true
+        "reset_network_namespaces",
+        "set_regulatory_domain",
+        "activate_network_config",  # only to replace another active profile
+        "deactivate_network_config",  # only for a profile that is not active
+    }
+)

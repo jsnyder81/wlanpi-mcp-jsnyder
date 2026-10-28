@@ -1,7 +1,7 @@
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Context, MCPServer
 
 # ── Advanced (mode, regulatory, battery) ─────────────────────────────────────
 
@@ -85,7 +85,7 @@ async def test_set_regulatory_domain_validates_code():
     advanced.register(mcp, mock_client)
 
     tool_fn = mcp._tool_manager._tools["set_regulatory_domain"].fn
-    result = await tool_fn(country_code="USA")  # invalid — 3 letters
+    result = await tool_fn(country_code="USA", ctx=Context())  # invalid — 3 letters
     assert "error" in result
 
 
@@ -99,7 +99,7 @@ async def test_set_regulatory_domain_accepts_valid_code():
     advanced.register(mcp, mock_client)
 
     tool_fn = mcp._tool_manager._tools["set_regulatory_domain"].fn
-    result = await tool_fn(country_code="us")
+    result = await tool_fn(country_code="us", ctx=Context())
 
     mock_client.post.assert_awaited_once_with(
         "/api/v1/system/reg-domain/set", json={"country": "US"}

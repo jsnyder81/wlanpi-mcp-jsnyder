@@ -501,7 +501,7 @@ def test_ticket_download_routes_are_the_only_routes_without_a_jwt(mcp):
     # BearerTokenMiddleware exempts everything under TICKET_PATH_PREFIXES, so
     # any other route added there would be served without authentication.
     from wlanpi_mcp.middleware.bearer_token import TICKET_PATH_PREFIXES
-    from wlanpi_mcp.tools import capture_file, profiler_reports
+    from wlanpi_mcp.tools import capture_file, netconfig_secrets, profiler_reports
 
     exempt = sorted(
         route.path
@@ -512,10 +512,15 @@ def test_ticket_download_routes_are_the_only_routes_without_a_jwt(mcp):
         [
             capture_file.DOWNLOAD_PREFIX + "{ticket}",
             profiler_reports.REPORT_PREFIX + "{ticket}",
+            netconfig_secrets.SECRET_PREFIX + "{ticket}",
         ]
     )
     assert sorted(TICKET_PATH_PREFIXES) == sorted(
-        [capture_file.DOWNLOAD_PREFIX, profiler_reports.REPORT_PREFIX]
+        [
+            capture_file.DOWNLOAD_PREFIX,
+            profiler_reports.REPORT_PREFIX,
+            netconfig_secrets.SECRET_PREFIX,
+        ]
     )
 
 

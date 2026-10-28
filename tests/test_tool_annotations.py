@@ -72,3 +72,10 @@ def test_every_tool_has_its_class(tools):
     }
     wrong = {n: t.annotations for n, t in tools.items() if t.annotations != expected[n]}
     assert wrong == {}
+
+
+def test_confirmed_tools_are_destructive(tools):
+    # Only a destructive action earns a protocol-level confirm (#88); asking
+    # before a read-only or additive one would just be noise.
+    assert hints.CONFIRMED - DESTRUCTIVE == set()
+    assert hints.CONFIRMED <= set(tools)
