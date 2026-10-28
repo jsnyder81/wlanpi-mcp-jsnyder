@@ -1,5 +1,5 @@
 """
-Elicitation confirms: pre-action (#88) and mid-flow override_active (#86).
+Elicitation confirms and picks (#88, #86, #87).
 
 A client that declares form elicitation gets a protocol-level confirm before
 anything destructive runs; every other client sees the pre-#88 behavior
@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
+from mcp.server.elicitation import _PRIMITIVE_SCHEMA_ADAPTER
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import (
@@ -25,12 +26,15 @@ from mcp.types import (
 )
 
 from wlanpi_mcp.client.core_client import CoreAPIError
-from wlanpi_mcp.tools import netconfig, system
+from wlanpi_mcp.tools import netconfig, system, wlan
 from wlanpi_mcp.tools.confirms import (
     _REQUEST_STATE,
+    CHOICE_KEY,
     CONFIRM_KEY,
+    choose_from,
     confirm_gate,
     form_elicitations_supported,
+    resume_choice,
     resume_with_state,
 )
 
@@ -571,3 +575,271 @@ async def test_deactivate_409_without_capability_is_unchanged():
     with pytest.raises(ToolError):
         await tool.run({"id": "lab"}, _ctx(None))
     core.get.assert_not_awaited()
+
+
+# ── mid-flow adapter pick (#87) ──────────────────────────────────────────────
+
+# Core's needsSelection body, verified against wlanpi-core main: candidates
+# carry iface, namespace, label and mode (no driver or band).
+NEEDS = {
+    "detail": "short",
+    "needsSelection": True,
+    "candidates": [
+        {
+            "iface": "wlan0",
+            "namespace": "root",
+            "label": "wlan0 (monitor, root)",
+            "mode": "monitor",
+        },
+        {
+            "iface": "wlanpi0",
+            "namespace": "lab",
+            "label": "wlanpi0 (monitor, lab)",
+            "mode": "monitor",
+        },
+    ],
+    "selectedAdapter": None,
+    "networks": [],
+    "scannedAt": None,
+}
+SCANNED = {
+    "detail": "short",
+    "needsSelection": False,
+    "candidates": [],
+    "selectedAdapter": NEEDS["candidates"][1],
+    "networks": [{"ssid": "labnet"}],
+    "scannedAt": "2026-10-28T12:00:00+00:00",
+}
+
+
+def _picking_core():
+    """Return a fake core: no iface gets needsSelection, an iface scans."""
+
+    async def get(path, params=None, **kwargs):
+        return SCANNED if params and "iface" in params else NEEDS
+
+    core = MagicMock()
+    core.get = AsyncMock(side_effect=get)
+    return core
+
+
+def _picked(choice, first):
+    responses = {CHOICE_KEY: ElicitResult(action="accept", content={"choice": choice})}
+    return _ctx(FORM_CAPS, responses, state=first.request_state)
+
+
+def _pick_options():
+    return [
+        (
+            "wlan0 (root)",
+            "wlan0 (monitor, root)",
+            {"iface": "wlan0", "namespace": "root"},
+        ),
+        (
+            "wlanpi0 (lab)",
+            "wlanpi0 (monitor, lab)",
+            {"iface": "wlanpi0", "namespace": "lab"},
+        ),
+    ]
+
+
+def test_choose_from_noop_without_capability():
+    assert choose_from(_ctx(None), "m", _pick_options(), {}) is None
+
+
+def test_choose_from_noop_without_options():
+    # Nothing to pick (core drift): the tool must surface its own result.
+    assert choose_from(_ctx(FORM_CAPS), "m", [], {}) is None
+
+
+def test_choose_from_asks_with_an_enum_field():
+    ask = choose_from(_ctx(FORM_CAPS), "m", _pick_options(), {"params": {}})
+    assert isinstance(ask, InputRequiredResult)
+    request = ask.input_requests[CHOICE_KEY]
+    assert request.params.message == "m"
+    schema = request.params.requested_schema
+    field = schema["properties"]["choice"]
+    assert field["type"] == "string"
+    assert [item["const"] for item in field["oneOf"]] == [
+        "wlan0 (root)",
+        "wlanpi0 (lab)",
+    ]
+    assert [item["title"] for item in field["oneOf"]] == [
+        "wlan0 (monitor, root)",
+        "wlanpi0 (monitor, lab)",
+    ]
+    assert schema["required"] == ["choice"]
+    # The state is sealed by RequestStateBoundary to bind the retry.
+    assert ask.request_state is not None
+
+
+def test_choice_schema_passes_the_sdk_primitive_gate():
+    # The pick schema is built by hand (its values vary per call), so check
+    # it against the SDK's own PrimitiveSchemaDefinition gate.
+    schema = (
+        choose_from(_ctx(FORM_CAPS), "m", _pick_options(), {})
+        .input_requests[CHOICE_KEY]
+        .params.requested_schema
+    )
+    for prop in schema["properties"].values():
+        _PRIMITIVE_SCHEMA_ADAPTER.validate_python(prop)  # must not raise
+
+
+def test_resume_choice_ignores_foreign_states():
+    responses = {CHOICE_KEY: ElicitResult(action="accept", content={"choice": "wlan0"})}
+    # confirm_gate's constant, a marked-less JSON dict, junk, and no state
+    # at all are not our retries.
+    assert resume_choice(_ctx(FORM_CAPS, responses, state=_REQUEST_STATE)) is None
+    assert resume_choice(_ctx(FORM_CAPS, responses, state='{"op": "activate"}')) is None
+    assert resume_choice(_ctx(FORM_CAPS, responses, state="{not json")) is None
+    assert resume_choice(_ctx(FORM_CAPS, responses)) is None
+
+
+async def test_scan_asks_listing_the_candidates():
+    core = _picking_core()
+    tool = _tools(wlan, core)["scan_wlan"]
+
+    first = await tool.run({}, _ctx(FORM_CAPS))
+    assert isinstance(first, InputRequiredResult)
+    field = first.input_requests[CHOICE_KEY].params.requested_schema["properties"][
+        "choice"
+    ]
+    assert [item["const"] for item in field["oneOf"]] == [
+        "wlan0 (root)",
+        "wlanpi0 (lab)",
+    ]
+    assert [item["title"] for item in field["oneOf"]] == [
+        c["label"] for c in NEEDS["candidates"]
+    ]
+    assert "iface" not in core.get.await_args.kwargs["params"]
+
+
+async def test_scan_accept_runs_on_the_chosen_interface():
+    core = _picking_core()
+    tool = _tools(wlan, core)["scan_wlan"]
+
+    args = {"detail": "full"}
+    first = await tool.run(args, _ctx(FORM_CAPS))
+    assert await tool.run(args, _picked("wlanpi0 (lab)", first)) == SCANNED
+    # The retry scans straight away: sealed args plus iface AND namespace
+    # from the chosen candidate entry, no second consult of the adapter list.
+    assert core.get.await_args_list[1].kwargs["params"] == {
+        "hidden": True,
+        "detail": "full",
+        "iface": "wlanpi0",
+        "namespace": "lab",
+    }
+
+
+async def test_scan_chosen_candidates_namespace_wins():
+    core = _picking_core()
+    tool = _tools(wlan, core)["scan_wlan"]
+
+    # Whether the caller omitted or gave namespace, the retry carries the
+    # chosen candidate's own: iface alone lets core prefer the root match,
+    # which can be a different adapter than the one picked.
+    args = {"namespace": "lab"}
+    first = await tool.run(args, _ctx(FORM_CAPS))
+    assert await tool.run(args, _picked("wlan0 (root)", first)) == SCANNED
+    assert core.get.await_args_list[1].kwargs["params"] == {
+        "hidden": True,
+        "detail": "short",
+        "iface": "wlan0",
+        "namespace": "root",
+    }
+
+
+@pytest.mark.parametrize("action", ["decline", "cancel"])
+async def test_scan_decline_returns_needs_selection_unchanged(action):
+    core = _picking_core()
+    tool = _tools(wlan, core)["scan_wlan"]
+
+    first = await tool.run({}, _ctx(FORM_CAPS))
+    declined = _ctx(
+        FORM_CAPS, {CHOICE_KEY: ElicitResult(action=action)}, state=first.request_state
+    )
+    assert await tool.run({}, declined) == NEEDS
+    core.get.assert_awaited_once()
+
+
+async def test_scan_without_capability_is_unchanged():
+    core = _picking_core()
+    tool = _tools(wlan, core)["scan_wlan"]
+
+    assert await tool.run({}, _ctx(None)) == NEEDS
+    core.get.assert_awaited_once()
+
+
+async def test_scan_forged_choice_fails_closed():
+    core = _picking_core()
+    tool = _tools(wlan, core)["scan_wlan"]
+
+    first = await tool.run({}, _ctx(FORM_CAPS))
+    # A value outside the sealed candidates (odd or forged client) is no
+    # scan: the retry is treated as a decline.
+    assert await tool.run({}, _picked("wlan9", first)) == NEEDS
+    core.get.assert_awaited_once()
+
+
+async def test_scan_answers_without_a_prior_ask_cannot_skip():
+    core = _picking_core()
+    tool = _tools(wlan, core)["scan_wlan"]
+
+    responses = {CHOICE_KEY: ElicitResult(action="accept", content={"choice": "wlan0"})}
+    result = await tool.run({}, _ctx(FORM_CAPS, responses))
+    assert isinstance(result, InputRequiredResult)
+    core.get.assert_awaited_once()
+
+
+async def test_scan_retry_without_answer_reasks():
+    core = _picking_core()
+    tool = _tools(wlan, core)["scan_wlan"]
+
+    first = await tool.run({}, _ctx(FORM_CAPS))
+    second = await tool.run({}, _ctx(FORM_CAPS, None, first.request_state))
+    assert isinstance(second, InputRequiredResult)
+
+
+async def test_scan_foreign_state_reasks_cleanly():
+    core = _picking_core()
+    tool = _tools(wlan, core)["scan_wlan"]
+
+    # A stale or foreign requestState (e.g. after a restart the boundary
+    # rejects before the tool runs; here: another mechanism's state) is not
+    # our retry: the tool runs its normal first round and asks fresh rather
+    # than scanning on an unverifiable pick.
+    responses = {CHOICE_KEY: ElicitResult(action="accept", content={"choice": "wlan0"})}
+    result = await tool.run({}, _ctx(FORM_CAPS, responses, state='{"op": "activate"}'))
+    assert isinstance(result, InputRequiredResult)
+    assert result.request_state is not None
+
+
+async def test_scan_with_interface_given_never_asks():
+    core = MagicMock()
+    core.get = AsyncMock(return_value=SCANNED)
+    tool = _tools(wlan, core)["scan_wlan"]
+
+    assert await tool.run({"interface": "wlan0"}, _ctx(FORM_CAPS)) == SCANNED
+    assert core.get.await_args.kwargs["params"]["iface"] == "wlan0"
+
+
+def test_candidates_without_labels_fall_back_to_iface_and_namespace():
+    bare = [{"iface": "wlan0"}, "junk", {}, {"iface": 3}]
+    assert wlan._adapter_choices(bare) == [
+        ("wlan0 (root)", "wlan0 (root)", {"iface": "wlan0", "namespace": "root"})
+    ]
+    assert wlan._adapter_choices(None) == []
+
+
+def test_same_iface_in_two_namespaces_stays_two_options():
+    options = wlan._adapter_choices(
+        [
+            {"iface": "wlan0", "namespace": "root", "label": "wlan0 (monitor, root)"},
+            {"iface": "wlan0", "namespace": "lab", "label": "wlan0 (monitor, lab)"},
+        ]
+    )
+    assert [value for value, _, _ in options] == ["wlan0 (root)", "wlan0 (lab)"]
+    assert [entry for _, _, entry in options] == [
+        {"iface": "wlan0", "namespace": "root"},
+        {"iface": "wlan0", "namespace": "lab"},
+    ]
