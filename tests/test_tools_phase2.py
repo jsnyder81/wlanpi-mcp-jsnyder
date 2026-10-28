@@ -22,7 +22,7 @@ async def test_scan_wlan_uses_canonical_endpoint():
     register(mcp, mock_client)
 
     tool_fn = mcp._tool_manager._tools["scan_wlan"].fn
-    await tool_fn(interface="wlan0", detail="full")
+    await tool_fn(Context(), interface="wlan0", detail="full")
 
     mock_client.get.assert_called_once()
     path = mock_client.get.call_args.args[0]
